@@ -377,49 +377,22 @@ static void display_init(void)
     return;
   }
 
-  ESP_LOGI(TAG_MAIN, "Framebuffer: %p, Size: %d bytes", framebuffer, LCD_V_RES * LCD_H_RES * 2);
-  ESP_LOGI(TAG_MAIN, "Display resolution: %dx%d (WxH after rotation)", LCD_V_RES, LCD_H_RES);
+  ESP_LOGI(TAG_MAIN, "Display ready: %dx%d, framebuffer: %p", LCD_V_RES, LCD_H_RES, framebuffer);
 
-  // Use raw RGB565 values to test
-  ESP_LOGI(TAG_MAIN, "Test 1: WHITE screen (0xFFFF)");
-  for (int i = 0; i < LCD_V_RES * LCD_H_RES; i++)
-  {
-    framebuffer[i] = 0xFFFF;
-  }
-  esp_lcd_panel_draw_bitmap(lcd_panel_handle, 0, 0, LCD_V_RES, LCD_H_RES, framebuffer);
-  vTaskDelay(pdMS_TO_TICKS(2000));
+  // Draw initial splash screen
+  lcd_fill_screen(COLOR_BLACK);
 
-  ESP_LOGI(TAG_MAIN, "Test 2: RED screen (0xF800)");
-  for (int i = 0; i < LCD_V_RES * LCD_H_RES; i++)
-  {
-    framebuffer[i] = 0xF800;
-  }
-  esp_lcd_panel_draw_bitmap(lcd_panel_handle, 0, 0, LCD_V_RES, LCD_H_RES, framebuffer);
-  vTaskDelay(pdMS_TO_TICKS(2000));
+  // Header
+  lcd_fill_rect(0, 0, 240, 18, COLOR_NAVY);
+  lcd_draw_string(50, 5, "WiFi REPEATER", COLOR_YELLOW, COLOR_NAVY);
 
-  ESP_LOGI(TAG_MAIN, "Test 3: GREEN screen (0x07E0)");
-  for (int i = 0; i < LCD_V_RES * LCD_H_RES; i++)
-  {
-    framebuffer[i] = 0x07E0;
-  }
-  esp_lcd_panel_draw_bitmap(lcd_panel_handle, 0, 0, LCD_V_RES, LCD_H_RES, framebuffer);
-  vTaskDelay(pdMS_TO_TICKS(2000));
+  // Status message
+  lcd_draw_string(30, 50, "Initializing...", COLOR_WHITE, COLOR_BLACK);
+  lcd_draw_string(30, 70, "Starting WiFi", COLOR_CYAN, COLOR_BLACK);
 
-  ESP_LOGI(TAG_MAIN, "Test 4: BLUE screen (0x001F)");
-  for (int i = 0; i < LCD_V_RES * LCD_H_RES; i++)
-  {
-    framebuffer[i] = 0x001F;
-  }
-  esp_lcd_panel_draw_bitmap(lcd_panel_handle, 0, 0, LCD_V_RES, LCD_H_RES, framebuffer);
-  vTaskDelay(pdMS_TO_TICKS(2000));
-
-  ESP_LOGI(TAG_MAIN, "Test 5: Text");
-  lcd_fill_screen(0x0000);                                  // Black
-  lcd_draw_string(10, 10, "WiFi REPEATER", 0xFFFF, 0x0000); // White on black
-  lcd_draw_string(10, 30, "Display Test", 0x07E0, 0x0000);  // Green on black
   lcd_flush();
 
-  ESP_LOGI(TAG_MAIN, "Display initialization complete");
+  ESP_LOGI(TAG_MAIN, "Display initialized successfully");
 }
 
 /**
@@ -434,14 +407,14 @@ static void display_update_status(void)
   lcd_fill_screen(COLOR_BLACK);
 
   // Header bar
-  lcd_fill_rect(0, 0, LCD_V_RES, 20, COLOR_NAVY);
-  lcd_draw_string(50, 6, "WiFi REPEATER", COLOR_YELLOW, COLOR_NAVY);
+  lcd_fill_rect(0, 0, 240, 18, COLOR_NAVY);
+  lcd_draw_string(50, 5, "WiFi REPEATER", COLOR_YELLOW, COLOR_NAVY);
 
-  int y = 25;
+  int y = 22;
 
   // Uplink Status
   lcd_draw_string(5, y, "UPLINK:", COLOR_CYAN, COLOR_BLACK);
-  y += 12;
+  y += 11;
 
   if (sta_connected)
   {
@@ -451,11 +424,11 @@ static void display_update_status(void)
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
     {
       lcd_draw_string(10, y, WIFI_STA_SSID, COLOR_GREEN, COLOR_BLACK);
-      y += 12;
+      y += 11;
 
       snprintf(line, sizeof(line), "RSSI:%ddBm", ap_info.rssi);
       lcd_draw_string(10, y, line, COLOR_WHITE, COLOR_BLACK);
-      y += 12;
+      y += 11;
     }
 
     // Get IP address
@@ -465,33 +438,32 @@ static void display_update_status(void)
       char ip_str[20];
       snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
       lcd_draw_string(10, y, ip_str, COLOR_WHITE, COLOR_BLACK);
-      y += 12;
+      y += 11;
     }
   }
   else
   {
     lcd_draw_string(10, y, "Disconnected", COLOR_RED, COLOR_BLACK);
-    y += 12;
+    y += 11;
   }
 
-  y += 5;
+  y += 4;
 
   // Access Point Status
   lcd_draw_string(5, y, "ACCESS POINT:", COLOR_CYAN, COLOR_BLACK);
-  y += 12;
+  y += 11;
 
   lcd_draw_string(10, y, WIFI_AP_SSID, COLOR_GREEN, COLOR_BLACK);
-  y += 12;
+  y += 11;
 
   char clients_str[32];
   snprintf(clients_str, sizeof(clients_str), "Clients:%d", ap_client_count);
   lcd_draw_string(10, y, clients_str, COLOR_WHITE, COLOR_BLACK);
-  y += 12;
 
   // NAT Status bar at bottom
   uint16_t nat_color = napt_enabled ? COLOR_DARKGREEN : COLOR_RED;
-  lcd_fill_rect(0, LCD_H_RES - 15, LCD_V_RES, 15, nat_color);
-  lcd_draw_string(60, LCD_H_RES - 12, napt_enabled ? "NAT ACTIVE" : "NAT DISABLED", COLOR_WHITE, nat_color);
+  lcd_fill_rect(0, 120, 240, 16, nat_color);
+  lcd_draw_string(60, 124, napt_enabled ? "NAT ACTIVE" : "NAT DISABLED", COLOR_WHITE, nat_color);
 
   // Flush to display
   lcd_flush();
@@ -719,7 +691,7 @@ static void status_task(void *pvParameters)
     // Update display
     display_update_status();
 
-    vTaskDelay(pdMS_TO_TICKS(5000)); // Update every 5 seconds
+    vTaskDelay(pdMS_TO_TICKS(2500)); // Update every 2.5 seconds
   }
 }
 
