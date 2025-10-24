@@ -9,6 +9,7 @@
  */
 
 #include <string.h>
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -24,6 +25,7 @@
 #include "lwip/sys.h"
 #include "lwip/lwip_napt.h"
 #include "dhcpserver/dhcpserver.h"
+#include "ping/ping_sock.h"
 
 // Display includes
 #include "driver/spi_master.h"
@@ -32,15 +34,41 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 
-/* WiFi Configuration */
-#define WIFI_STA_SSID "weeblet"
-#define WIFI_STA_PASSWORD "niconiconii"
-#define WIFI_STA_MAXIMUM_RETRY 10
+// Web server includes
+#include "esp_http_server.h"
 
-#define WIFI_AP_SSID "NINTENDO_WIFI"
-#define WIFI_AP_PASSWORD "" // Empty = Open network
+/* WiFi Configuration - Dynamic (loaded from NVS) */
+#define WIFI_STA_MAXIMUM_RETRY 10
 #define WIFI_AP_CHANNEL 1
 #define WIFI_AP_MAX_CONNECTIONS 10
+
+/* ═══════════════════════════════════════════════════════════════════
+ * DEFAULT CONFIGURATION (for initial setup via web interface)
+ * ═══════════════════════════════════════════════════════════════════ */
+#define DEFAULT_CONFIG_AP_SSID "CardRepeater" // AP name for config mode
+#define DEFAULT_CONFIG_AP_PASSWORD ""         // Open AP for easy access
+#define WEB_CONFIG_IP "192.168.4.1"           // IP address for web config
+/* ═══════════════════════════════════════════════════════════════════ */
+
+/* NVS Configuration Keys */
+#define NVS_NAMESPACE "wifi_config"
+#define NVS_KEY_CONFIGURED "configured"
+#define NVS_KEY_STA_SSID "sta_ssid"
+#define NVS_KEY_STA_PASS "sta_pass"
+#define NVS_KEY_AP_SSID "ap_ssid"
+#define NVS_KEY_AP_PASS "ap_pass"
+
+/* Configuration storage */
+typedef struct
+{
+  char sta_ssid[32];
+  char sta_password[64];
+  char ap_ssid[32];
+  char ap_password[64];
+  bool configured;
+} repeater_config_t;
+
+static repeater_config_t stored_config = {0};
 
 /* FreeRTOS event group to signal when we are connected */
 #define WIFI_CONNECTED_BIT BIT0
@@ -64,6 +92,7 @@ static esp_netif_t *ap_netif = NULL;
 /* Status tracking */
 static bool sta_connected = false;
 static bool napt_enabled = false;
+static bool internet_connected = false;
 
 /* M5Stack Cardputer Display Pin Configuration */
 #define LCD_MOSI_PIN 35 // DATA
@@ -77,10 +106,17 @@ static bool napt_enabled = false;
 #define LCD_V_RES 240
 #define LCD_PIXEL_CLK 40000000
 
+/* Web Server Configuration */
+#define WEB_SERVER_STACK_SIZE 8192
+
 /* Display handles */
 static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
 static esp_lcd_panel_handle_t lcd_panel_handle = NULL;
 static int ap_client_count = 0;
+
+/* Web server handle */
+static httpd_handle_t web_server = NULL;
+static bool config_mode = false;
 
 /**
  * RGB565 Color definitions (with byte swap for ST7789)
@@ -96,6 +132,13 @@ static int ap_client_count = 0;
 #define COLOR_NAVY RGB565(0, 0, 128)
 #define COLOR_DARKGREEN RGB565(0, 128, 0)
 #define COLOR_ORANGE RGB565(255, 165, 0)
+
+// Terminal Green Theme Colors (Classic CRT Green)
+#define TERM_BG RGB565(0, 0, 0)          // Pure black background
+#define TERM_GREEN RGB565(0, 255, 0)     // Bright pure green (classic terminal)
+#define TERM_GREEN_DIM RGB565(0, 180, 0) // Dimmed green
+#define TERM_GREEN_DARK RGB565(0, 60, 0) // Dark green for boxes
+#define TERM_ACCENT RGB565(50, 255, 50)  // Lighter accent green
 
 // Simple 8x8 font bitmap (ASCII 32-127) - abbreviated for space
 static const uint8_t font8x8[96][8] = {
@@ -199,6 +242,75 @@ static const uint8_t font8x8[96][8] = {
 
 // Display buffer (rotated: 240x135)
 static uint16_t *framebuffer = NULL;
+
+/* ═══════════════════════════════════════════════════════════════════
+ * WEB SERVER HTML PAGES
+ * ═══════════════════════════════════════════════════════════════════ */
+static const char *html_config_page =
+    "<!DOCTYPE html>"
+    "<html><head>"
+    "<meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>CardRepeater Config</title>"
+    "<style>"
+    "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0}"
+    "h1{color:#333;text-align:center;background:#4CAF50;color:white;padding:15px;border-radius:5px}"
+    ".ip-banner{background:#2196F3;color:white;padding:10px;text-align:center;font-size:16px;font-weight:bold;border-radius:5px;margin-bottom:20px}"
+    "form{background:white;padding:20px;border-radius:5px;box-shadow:0 2px 4px rgba(0,0,0,0.1);max-width:500px;margin:20px auto}"
+    "label{display:block;margin:10px 0 5px;font-weight:bold;color:#555}"
+    "input{width:100%;padding:8px;margin-bottom:15px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}"
+    "button{background:#4CAF50;color:white;padding:12px 20px;border:none;border-radius:4px;cursor:pointer;width:100%;font-size:16px}"
+    "button:hover{background:#45a049}"
+    ".info{background:#e3f2fd;padding:10px;border-radius:4px;margin:10px 0;border-left:4px solid #2196F3}"
+    ".section{margin:20px 0;padding:15px;background:#fafafa;border-radius:4px}"
+    ".status{text-align:center;padding:10px;margin:10px 0;border-radius:4px}"
+    ".success{background:#d4edda;color:#155724;border:1px solid #c3e6cb}"
+    "</style></head><body>"
+    "<h1>CardRepeater Setup</h1>"
+    "<form action='/save' method='GET'>"
+    "<div class='section'>"
+    "<h2 style='color:#4CAF50;margin-top:0'>Uplink WiFi</h2>"
+    "<label>Network Name (SSID):</label>"
+    "<input type='text' name='sta_ssid' placeholder='Your WiFi network name' required>"
+    "<label>Password:</label>"
+    "<input type='password' name='sta_pass' placeholder='WiFi password'>"
+    "</div>"
+    "<div class='section'>"
+    "<h2 style='color:#4CAF50;margin-top:0'>Access Point</h2>"
+    "<label>AP Name (SSID):</label>"
+    "<input type='text' name='ap_ssid' placeholder='CardRepeater' required>"
+    "<label>AP Password:</label>"
+    "<input type='password' name='ap_pass' placeholder='Leave empty for open network'>"
+    "<div class='info'>Note: Password must be at least 8 characters or leave empty for open network</div>"
+    "</div>"
+    "<button type='submit'>Save & Restart</button>"
+    "</form>"
+    "<div class='status' style='background:#fff3cd;color:#856404;border:1px solid #ffeeba;margin-top:20px'>"
+    "Device will restart after saving configuration"
+    "</div>"
+    "</body></html>";
+
+static const char *html_success_page =
+    "<!DOCTYPE html>"
+    "<html><head>"
+    "<meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<meta http-equiv='refresh' content='10;url=/'>"
+    "<title>Config Saved</title>"
+    "<style>"
+    "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0;text-align:center;padding-top:50px}"
+    ".success{background:#d4edda;color:#155724;padding:30px;border-radius:5px;max-width:500px;margin:0 auto;box-shadow:0 2px 4px rgba(0,0,0,0.1)}"
+    "h1{color:#155724;margin-top:0}"
+    ".spinner{border:4px solid #f3f3f3;border-top:4px solid #4CAF50;border-radius:50%;width:40px;height:40px;animation:spin 1s linear infinite;margin:20px auto}"
+    "@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}"
+    "</style></head><body>"
+    "<div class='success'>"
+    "<h1>Configuration Saved!</h1>"
+    "<p>Your WiFi settings have been saved successfully.</p>"
+    "<p>The device is restarting...</p>"
+    "<div class='spinner'></div>"
+    "<p style='color:#666;font-size:14px'>This page will refresh in 10 seconds</p>"
+    "</div></body></html>";
 
 /**
  * Fill screen with a color
@@ -380,90 +492,494 @@ static void display_init(void)
   ESP_LOGI(TAG_MAIN, "Display ready: %dx%d, framebuffer: %p", LCD_V_RES, LCD_H_RES, framebuffer);
 
   // Draw initial splash screen
-  lcd_fill_screen(COLOR_BLACK);
+  lcd_fill_screen(TERM_BG);
 
   // Header
-  lcd_fill_rect(0, 0, 240, 18, COLOR_NAVY);
-  lcd_draw_string(50, 5, "WiFi REPEATER", COLOR_YELLOW, COLOR_NAVY);
+  lcd_fill_rect(0, 0, 240, 18, TERM_GREEN_DARK);
+  lcd_draw_string(50, 5, "WiFi REPEATER", TERM_GREEN, TERM_GREEN_DARK);
 
   // Status message
-  lcd_draw_string(30, 50, "Initializing...", COLOR_WHITE, COLOR_BLACK);
-  lcd_draw_string(30, 70, "Starting WiFi", COLOR_CYAN, COLOR_BLACK);
+  lcd_draw_string(30, 50, "Initializing...", TERM_ACCENT, TERM_BG);
+  lcd_draw_string(30, 70, "Starting WiFi", TERM_GREEN_DIM, TERM_BG);
 
   lcd_flush();
 
   ESP_LOGI(TAG_MAIN, "Display initialized successfully");
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * WEB SERVER HELPER FUNCTIONS
+ * ═══════════════════════════════════════════════════════════════════ */
+
 /**
- * Update Display with current status
+ * URL decode helper function
+ */
+static void url_decode(char *dst, const char *src)
+{
+  char a, b;
+  while (*src)
+  {
+    if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b)))
+    {
+      if (a >= 'a')
+        a -= 'a' - 'A';
+      if (a >= 'A')
+        a -= ('A' - 10);
+      else
+        a -= '0';
+      if (b >= 'a')
+        b -= 'a' - 'A';
+      if (b >= 'A')
+        b -= ('A' - 10);
+      else
+        b -= '0';
+      *dst++ = 16 * a + b;
+      src += 3;
+    }
+    else if (*src == '+')
+    {
+      *dst++ = ' ';
+      src++;
+    }
+    else
+    {
+      *dst++ = *src++;
+    }
+  }
+  *dst = '\0';
+}
+
+/**
+ * Parse URL query parameters and extract form fields
+ */
+static bool parse_query_param(const char *query, const char *field_name, char *output, size_t output_len)
+{
+  if (!query)
+    return false;
+
+  char search_key[64];
+  snprintf(search_key, sizeof(search_key), "%s=", field_name);
+
+  const char *start = strstr(query, search_key);
+  if (!start)
+    return false;
+
+  start += strlen(search_key);
+  const char *end = strchr(start, '&');
+  size_t len = end ? (end - start) : strlen(start);
+
+  if (len >= output_len)
+    len = output_len - 1;
+
+  char temp[128];
+  if (len >= sizeof(temp))
+    len = sizeof(temp) - 1;
+
+  strncpy(temp, start, len);
+  temp[len] = '\0';
+
+  url_decode(output, temp);
+  return true;
+}
+
+/**
+ * Save WiFi configuration to NVS
+ */
+static esp_err_t save_wifi_config(const repeater_config_t *config)
+{
+  nvs_handle_t nvs_handle;
+  esp_err_t err;
+
+  err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG_MAIN, "Failed to open NVS: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  // Save all configuration values
+  nvs_set_u8(nvs_handle, NVS_KEY_CONFIGURED, 1);
+  nvs_set_str(nvs_handle, NVS_KEY_STA_SSID, config->sta_ssid);
+  nvs_set_str(nvs_handle, NVS_KEY_STA_PASS, config->sta_password);
+  nvs_set_str(nvs_handle, NVS_KEY_AP_SSID, config->ap_ssid);
+  nvs_set_str(nvs_handle, NVS_KEY_AP_PASS, config->ap_password);
+
+  err = nvs_commit(nvs_handle);
+  nvs_close(nvs_handle);
+
+  if (err == ESP_OK)
+  {
+    ESP_LOGI(TAG_MAIN, "✓ Configuration saved to NVS");
+  }
+  return err;
+}
+
+/**
+ * Load WiFi configuration from NVS
+ */
+static esp_err_t load_wifi_config(repeater_config_t *config)
+{
+  nvs_handle_t nvs_handle;
+  esp_err_t err;
+
+  err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+  if (err != ESP_OK)
+  {
+    return err;
+  }
+
+  uint8_t configured = 0;
+  size_t len;
+
+  err = nvs_get_u8(nvs_handle, NVS_KEY_CONFIGURED, &configured);
+  if (err != ESP_OK || configured != 1)
+  {
+    nvs_close(nvs_handle);
+    return ESP_ERR_NVS_NOT_FOUND;
+  }
+
+  // Load all strings
+  len = sizeof(config->sta_ssid);
+  nvs_get_str(nvs_handle, NVS_KEY_STA_SSID, config->sta_ssid, &len);
+
+  len = sizeof(config->sta_password);
+  nvs_get_str(nvs_handle, NVS_KEY_STA_PASS, config->sta_password, &len);
+
+  len = sizeof(config->ap_ssid);
+  nvs_get_str(nvs_handle, NVS_KEY_AP_SSID, config->ap_ssid, &len);
+
+  len = sizeof(config->ap_password);
+  nvs_get_str(nvs_handle, NVS_KEY_AP_PASS, config->ap_password, &len);
+
+  config->configured = true;
+  nvs_close(nvs_handle);
+
+  ESP_LOGI(TAG_MAIN, "✓ Configuration loaded from NVS");
+  return ESP_OK;
+}
+
+/**
+ * Clear configuration from NVS
+ */
+static esp_err_t clear_wifi_config(void)
+{
+  nvs_handle_t nvs_handle;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  if (err == ESP_OK)
+  {
+    nvs_erase_all(nvs_handle);
+    nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG_MAIN, "✓ Configuration cleared");
+  }
+  return err;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * WEB SERVER HTTP HANDLERS
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * Root page handler - serves configuration form
+ */
+static esp_err_t root_handler(httpd_req_t *req)
+{
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_send(req, html_config_page, HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+/**
+ * Save configuration handler - processes form submission via GET
+ */
+static esp_err_t save_handler(httpd_req_t *req)
+{
+  char query[512];
+  size_t query_len = sizeof(query);
+
+  // Get query string from URL
+  if (httpd_req_get_url_query_str(req, query, query_len) != ESP_OK)
+  {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing query parameters");
+    return ESP_FAIL;
+  }
+
+  ESP_LOGI(TAG_MAIN, "Received config query");
+
+  // Parse query parameters
+  repeater_config_t new_config = {0};
+
+  if (!parse_query_param(query, "sta_ssid", new_config.sta_ssid, sizeof(new_config.sta_ssid)))
+  {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing sta_ssid");
+    return ESP_FAIL;
+  }
+
+  parse_query_param(query, "sta_pass", new_config.sta_password, sizeof(new_config.sta_password));
+
+  if (!parse_query_param(query, "ap_ssid", new_config.ap_ssid, sizeof(new_config.ap_ssid)))
+  {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing ap_ssid");
+    return ESP_FAIL;
+  }
+
+  parse_query_param(query, "ap_pass", new_config.ap_password, sizeof(new_config.ap_password));
+
+  // Validate AP password (must be 8+ chars or empty)
+  if (strlen(new_config.ap_password) > 0 && strlen(new_config.ap_password) < 8)
+  {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "AP password must be at least 8 characters or empty");
+    return ESP_FAIL;
+  }
+
+  new_config.configured = true;
+
+  ESP_LOGI(TAG_MAIN, "New configuration:");
+  ESP_LOGI(TAG_MAIN, "  Uplink SSID: %s", new_config.sta_ssid);
+  ESP_LOGI(TAG_MAIN, "  AP SSID: %s", new_config.ap_ssid);
+  ESP_LOGI(TAG_MAIN, "  AP Password: %s", strlen(new_config.ap_password) > 0 ? "***" : "(open)");
+
+  // Save configuration
+  esp_err_t err = save_wifi_config(&new_config);
+  if (err != ESP_OK)
+  {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save configuration");
+    return ESP_FAIL;
+  }
+
+  // Send success page
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_send(req, html_success_page, HTTPD_RESP_USE_STRLEN);
+
+  // Schedule restart
+  ESP_LOGI(TAG_MAIN, "Configuration saved, restarting in 3 seconds...");
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  esp_restart();
+
+  return ESP_OK;
+}
+
+/**
+ * Start web server
+ */
+static httpd_handle_t start_webserver(void)
+{
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.stack_size = WEB_SERVER_STACK_SIZE;
+  config.uri_match_fn = httpd_uri_match_wildcard;
+
+  ESP_LOGI(TAG_MAIN, "Starting web server on port %d", config.server_port);
+
+  if (httpd_start(&web_server, &config) == ESP_OK)
+  {
+    // Register URI handlers
+    httpd_uri_t root = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = root_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(web_server, &root);
+
+    httpd_uri_t save = {
+        .uri = "/save",
+        .method = HTTP_GET,
+        .handler = save_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(web_server, &save);
+
+    ESP_LOGI(TAG_MAIN, "✓ Web server started successfully");
+    ESP_LOGI(TAG_MAIN, "  Access at: http://192.168.4.1/");
+
+    return web_server;
+  }
+
+  ESP_LOGE(TAG_MAIN, "✗ Failed to start web server");
+  return NULL;
+}
+
+/**
+ * Stop web server
+ */
+static void stop_webserver(httpd_handle_t server)
+{
+  if (server)
+  {
+    httpd_stop(server);
+    ESP_LOGI(TAG_MAIN, "Web server stopped");
+  }
+}
+
+/**
+ * Draw signal strength bars (1-4 bars based on RSSI)
+ */
+static void draw_signal_bars(int x, int y, int rssi)
+{
+  // Calculate number of bars (1-4) based on RSSI
+  int bars = 1;
+  if (rssi > -70)
+    bars = 4;
+  else if (rssi > -80)
+    bars = 3;
+  else if (rssi > -90)
+    bars = 2;
+
+  uint16_t bar_color = TERM_GREEN; // Always bright green when active
+
+  // Draw 4 bars with increasing height
+  for (int i = 0; i < 4; i++)
+  {
+    int bar_height = 2 + (i * 2);                                 // Heights: 2, 4, 6, 8
+    int bar_y = y + (8 - bar_height);                             // Align bottom
+    uint16_t color = (i < bars) ? bar_color : RGB565(20, 40, 20); // Dark green if not active
+    lcd_fill_rect(x + (i * 4), bar_y, 3, bar_height, color);
+  }
+}
+
+/**
+ * Draw a filled circle (using filled rectangle approximation)
+ */
+static void draw_circle(int x, int y, int radius, uint16_t color)
+{
+  for (int dy = -radius; dy <= radius; dy++)
+  {
+    for (int dx = -radius; dx <= radius; dx++)
+    {
+      if (dx * dx + dy * dy <= radius * radius)
+      {
+        if (x + dx >= 0 && x + dx < LCD_V_RES && y + dy >= 0 && y + dy < LCD_H_RES)
+        {
+          framebuffer[(y + dy) * LCD_V_RES + (x + dx)] = color;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Update Display with beautiful visual UI
  */
 static void display_update_status(void)
 {
   if (!framebuffer)
     return;
 
-  // Clear screen
-  lcd_fill_screen(COLOR_BLACK);
+  // Clear screen with pure black background (terminal style)
+  lcd_fill_screen(TERM_BG);
 
-  // Header bar
-  lcd_fill_rect(0, 0, 240, 18, COLOR_NAVY);
-  lcd_draw_string(50, 5, "WiFi REPEATER", COLOR_YELLOW, COLOR_NAVY);
+  // ═══════════════════════════════════════════════════════════
+  // HEADER with Title - Terminal style
+  // ═══════════════════════════════════════════════════════════
+  lcd_fill_rect(0, 0, 240, 16, TERM_GREEN_DARK);
+  lcd_draw_string(30, 4, "Card Wifi Repeater", TERM_GREEN, TERM_GREEN_DARK);
 
-  int y = 22;
+  // ═══════════════════════════════════════════════════════════
+  // UPLINK SECTION (Box 1)
+  // ═══════════════════════════════════════════════════════════
+  int uplink_y = 18;
 
-  // Uplink Status
-  lcd_draw_string(5, y, "UPLINK:", COLOR_CYAN, COLOR_BLACK);
-  y += 11;
+  // Draw uplink box background with green border
+  lcd_fill_rect(2, uplink_y, 236, 42, TERM_BG);
+  // Green border
+  lcd_fill_rect(2, uplink_y, 236, 1, TERM_GREEN_DIM);      // Top
+  lcd_fill_rect(2, uplink_y + 41, 236, 1, TERM_GREEN_DIM); // Bottom
+  lcd_fill_rect(2, uplink_y, 1, 42, TERM_GREEN_DIM);       // Left
+  lcd_fill_rect(237, uplink_y, 1, 42, TERM_GREEN_DIM);     // Right
+
+  // Uplink label
+  lcd_draw_string(6, uplink_y + 3, "UPLINK", TERM_GREEN, TERM_BG);
 
   if (sta_connected)
   {
     wifi_ap_record_t ap_info;
-    char line[32];
-
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
     {
-      lcd_draw_string(10, y, WIFI_STA_SSID, COLOR_GREEN, COLOR_BLACK);
-      y += 11;
+      // WiFi name in bright green
+      lcd_draw_string(6, uplink_y + 14, stored_config.sta_ssid, TERM_ACCENT, TERM_BG);
 
-      snprintf(line, sizeof(line), "RSSI:%ddBm", ap_info.rssi);
-      lcd_draw_string(10, y, line, COLOR_WHITE, COLOR_BLACK);
-      y += 11;
+      // Signal strength bars
+      draw_signal_bars(6, uplink_y + 27, ap_info.rssi);
+
+      // RSSI value
+      char rssi_str[16];
+      snprintf(rssi_str, sizeof(rssi_str), "%ddBm", ap_info.rssi);
+      lcd_draw_string(26, uplink_y + 27, rssi_str, TERM_GREEN_DIM, TERM_BG);
     }
 
-    // Get IP address
-    esp_netif_ip_info_t ip_info;
-    if (sta_netif && esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK)
+    // Internet status indicator (circle) - Green when internet is actually working
+    if (internet_connected)
     {
-      char ip_str[20];
-      snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
-      lcd_draw_string(10, y, ip_str, COLOR_WHITE, COLOR_BLACK);
-      y += 11;
+      lcd_draw_string(200, uplink_y + 3, "NET", TERM_GREEN_DIM, TERM_BG);
+      draw_circle(228, uplink_y + 7, 5, TERM_GREEN); // Bright green = Internet confirmed
+    }
+    else if (sta_connected)
+    {
+      lcd_draw_string(203, uplink_y + 3, "...", TERM_GREEN_DIM, TERM_BG);
+      draw_circle(228, uplink_y + 7, 5, RGB565(200, 200, 0)); // Yellow = Connected, checking...
+    }
+    else
+    {
+      draw_circle(228, uplink_y + 7, 5, RGB565(200, 0, 0)); // Red = Disconnected
     }
   }
   else
   {
-    lcd_draw_string(10, y, "Disconnected", COLOR_RED, COLOR_BLACK);
-    y += 11;
+    // Disconnected state
+    lcd_draw_string(6, uplink_y + 14, "Searching...", TERM_GREEN_DIM, TERM_BG);
+    draw_circle(228, uplink_y + 7, 5, RGB565(200, 0, 0)); // Red = Disconnected
   }
 
-  y += 4;
+  // ═══════════════════════════════════════════════════════════
+  // ACCESS POINT SECTION (Box 2)
+  // ═══════════════════════════════════════════════════════════
+  int ap_y = 62;
 
-  // Access Point Status
-  lcd_draw_string(5, y, "ACCESS POINT:", COLOR_CYAN, COLOR_BLACK);
-  y += 11;
+  // Draw AP box background with green border
+  lcd_fill_rect(2, ap_y, 236, 42, TERM_BG);
+  // Green border
+  lcd_fill_rect(2, ap_y, 236, 1, TERM_GREEN_DIM);      // Top
+  lcd_fill_rect(2, ap_y + 41, 236, 1, TERM_GREEN_DIM); // Bottom
+  lcd_fill_rect(2, ap_y, 1, 42, TERM_GREEN_DIM);       // Left
+  lcd_fill_rect(237, ap_y, 1, 42, TERM_GREEN_DIM);     // Right
 
-  lcd_draw_string(10, y, WIFI_AP_SSID, COLOR_GREEN, COLOR_BLACK);
-  y += 11;
+  // AP label
+  lcd_draw_string(6, ap_y + 3, "ACCESS POINT", TERM_GREEN, TERM_BG);
 
-  char clients_str[32];
-  snprintf(clients_str, sizeof(clients_str), "Clients:%d", ap_client_count);
-  lcd_draw_string(10, y, clients_str, COLOR_WHITE, COLOR_BLACK);
+  // AP SSID
+  lcd_draw_string(6, ap_y + 14, stored_config.ap_ssid, TERM_ACCENT, TERM_BG);
 
-  // NAT Status bar at bottom
-  uint16_t nat_color = napt_enabled ? COLOR_DARKGREEN : COLOR_RED;
-  lcd_fill_rect(0, 120, 240, 16, nat_color);
-  lcd_draw_string(60, 124, napt_enabled ? "NAT ACTIVE" : "NAT DISABLED", COLOR_WHITE, nat_color);
+  // Password status
+  if (strlen(stored_config.ap_password) > 0)
+  {
+    lcd_draw_string(6, ap_y + 25, "Secured", TERM_GREEN_DIM, TERM_BG);
+  }
+  else
+  {
+    lcd_draw_string(6, ap_y + 25, "Open", TERM_GREEN_DIM, TERM_BG);
+  }
+
+  // Client count (bright green to match theme)
+  char clients_str[24];
+  snprintf(clients_str, sizeof(clients_str), "CL:%d", ap_client_count);
+  lcd_draw_string(200, ap_y + 3, clients_str, TERM_GREEN, TERM_BG);
+
+  // ═══════════════════════════════════════════════════════════
+  // CONFIG IP SECTION (Box 3) - Only if no clients
+  // ═══════════════════════════════════════════════════════════
+  if (ap_client_count == 0)
+  {
+    int config_y = 106;
+
+    // Draw config box background with green border
+    lcd_fill_rect(2, config_y, 236, 18, TERM_BG);
+    // Green border
+    lcd_fill_rect(2, config_y, 236, 1, TERM_GREEN_DIM);      // Top
+    lcd_fill_rect(2, config_y + 17, 236, 1, TERM_GREEN_DIM); // Bottom
+    lcd_fill_rect(2, config_y, 1, 18, TERM_GREEN_DIM);       // Left
+    lcd_fill_rect(237, config_y, 1, 18, TERM_GREEN_DIM);     // Right
+
+    lcd_draw_string(6, config_y + 5, "Config:", TERM_GREEN_DIM, TERM_BG);
+    lcd_draw_string(56, config_y + 5, WEB_CONFIG_IP, TERM_GREEN, TERM_BG);
+  }
 
   // Flush to display
   lcd_flush();
@@ -506,6 +1022,60 @@ static void setup_dns_forwarding(void)
   else
   {
     ESP_LOGE(TAG_MAIN, "Failed to get DNS info from STA interface");
+  }
+}
+
+/**
+ * Check internet connectivity by pinging Google DNS
+ */
+static void check_internet_connectivity(void)
+{
+  if (!sta_connected)
+  {
+    internet_connected = false;
+    return;
+  }
+
+  ESP_LOGI(TAG_MAIN, "Checking internet connectivity...");
+
+  esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
+  ping_config.count = 1;
+  ping_config.interval_ms = 1000;
+  ping_config.timeout_ms = 3000;
+  ping_config.target_addr.u_addr.ip4.addr = ipaddr_addr("8.8.8.8"); // Google DNS
+  ping_config.target_addr.type = IPADDR_TYPE_V4;
+
+  esp_ping_callbacks_t cbs = {0};
+  esp_ping_handle_t ping_handle = NULL;
+
+  esp_err_t ret = esp_ping_new_session(&ping_config, &cbs, &ping_handle);
+  if (ret == ESP_OK)
+  {
+    esp_ping_start(ping_handle);
+    vTaskDelay(pdMS_TO_TICKS(3500)); // Wait for ping to complete
+    esp_ping_stop(ping_handle);
+
+    uint32_t transmitted, received;
+    esp_ping_get_profile(ping_handle, ESP_PING_PROF_REQUEST, &transmitted, sizeof(transmitted));
+    esp_ping_get_profile(ping_handle, ESP_PING_PROF_REPLY, &received, sizeof(received));
+
+    if (received > 0)
+    {
+      ESP_LOGI(TAG_MAIN, "✓ Internet connectivity confirmed (ping successful)");
+      internet_connected = true;
+    }
+    else
+    {
+      ESP_LOGW(TAG_MAIN, "✗ No internet connectivity (ping failed)");
+      internet_connected = false;
+    }
+
+    esp_ping_delete_session(ping_handle);
+  }
+  else
+  {
+    ESP_LOGE(TAG_MAIN, "Failed to create ping session");
+    internet_connected = false;
   }
 }
 
@@ -601,6 +1171,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     {
       enable_napt();
     }
+
+    /* Check internet connectivity */
+    check_internet_connectivity();
+
     display_update_status();
   }
 }
@@ -615,14 +1189,14 @@ static void wifi_init_softap(void)
   wifi_config_t wifi_ap_config = {};
 
   /* Configure AP settings */
-  memcpy(wifi_ap_config.ap.ssid, WIFI_AP_SSID, strlen(WIFI_AP_SSID));
-  wifi_ap_config.ap.ssid_len = strlen(WIFI_AP_SSID);
-  memcpy(wifi_ap_config.ap.password, WIFI_AP_PASSWORD, strlen(WIFI_AP_PASSWORD));
+  memcpy(wifi_ap_config.ap.ssid, stored_config.ap_ssid, strlen(stored_config.ap_ssid));
+  wifi_ap_config.ap.ssid_len = strlen(stored_config.ap_ssid);
+  memcpy(wifi_ap_config.ap.password, stored_config.ap_password, strlen(stored_config.ap_password));
   wifi_ap_config.ap.channel = WIFI_AP_CHANNEL;
   wifi_ap_config.ap.max_connection = WIFI_AP_MAX_CONNECTIONS;
 
   /* Set auth mode based on password */
-  if (strlen(WIFI_AP_PASSWORD) > 0)
+  if (strlen(stored_config.ap_password) > 0)
   {
     wifi_ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
   }
@@ -636,8 +1210,8 @@ static void wifi_init_softap(void)
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config));
 
   ESP_LOGI(TAG_AP, "✓ AP configured: SSID=%s, Channel=%d, Auth=%s",
-           WIFI_AP_SSID, WIFI_AP_CHANNEL,
-           strlen(WIFI_AP_PASSWORD) > 0 ? "WPA2" : "OPEN");
+           stored_config.ap_ssid, WIFI_AP_CHANNEL,
+           strlen(stored_config.ap_password) > 0 ? "WPA2" : "OPEN");
 }
 
 /**
@@ -650,8 +1224,8 @@ static void wifi_init_sta(void)
   wifi_config_t wifi_sta_config = {};
 
   /* Configure STA settings */
-  memcpy(wifi_sta_config.sta.ssid, WIFI_STA_SSID, strlen(WIFI_STA_SSID));
-  memcpy(wifi_sta_config.sta.password, WIFI_STA_PASSWORD, strlen(WIFI_STA_PASSWORD));
+  memcpy(wifi_sta_config.sta.ssid, stored_config.sta_ssid, strlen(stored_config.sta_ssid));
+  memcpy(wifi_sta_config.sta.password, stored_config.sta_password, strlen(stored_config.sta_password));
   wifi_sta_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
   wifi_sta_config.sta.failure_retry_cnt = WIFI_STA_MAXIMUM_RETRY;
   wifi_sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
@@ -659,7 +1233,7 @@ static void wifi_init_sta(void)
 
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
 
-  ESP_LOGI(TAG_STA, "✓ Station configured: connecting to SSID=%s", WIFI_STA_SSID);
+  ESP_LOGI(TAG_STA, "✓ Station configured: connecting to SSID=%s", stored_config.sta_ssid);
 }
 
 /**
@@ -671,27 +1245,32 @@ static void status_task(void *pvParameters)
   {
     if (sta_connected)
     {
+      // Check internet connectivity periodically
+      check_internet_connectivity();
+
       wifi_ap_record_t ap_info;
       if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
       {
         ESP_LOGI(TAG_MAIN, "━━━ STATUS ━━━");
         ESP_LOGI(TAG_MAIN, "Uplink: %s | RSSI: %d dBm",
-                 WIFI_STA_SSID, ap_info.rssi);
+                 stored_config.sta_ssid, ap_info.rssi);
         ESP_LOGI(TAG_MAIN, "AP Clients: %d", ap_client_count);
         ESP_LOGI(TAG_MAIN, "NAT: %s", napt_enabled ? "✓ ACTIVE" : "✗ DISABLED");
+        ESP_LOGI(TAG_MAIN, "Internet: %s", internet_connected ? "✓ ONLINE" : "✗ OFFLINE");
         ESP_LOGI(TAG_MAIN, "Repeater: %s",
-                 (sta_connected && napt_enabled) ? "✓ READY" : "⧗ INITIALIZING");
+                 (sta_connected && internet_connected) ? "✓ READY" : "⧗ INITIALIZING");
       }
     }
     else
     {
+      internet_connected = false;
       ESP_LOGI(TAG_MAIN, "Waiting for uplink connection...");
     }
 
     // Update display
     display_update_status();
 
-    vTaskDelay(pdMS_TO_TICKS(2500)); // Update every 2.5 seconds
+    vTaskDelay(pdMS_TO_TICKS(10000)); // Update every 10 seconds
   }
 }
 
@@ -709,7 +1288,7 @@ extern "C" void app_main(void)
   display_init();
   ESP_LOGI(TAG_MAIN, "✓ Display initialized");
 
-  /* Initialize NVS - Required for WiFi */
+  /* Initialize NVS - Required for WiFi and config storage */
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
   {
@@ -717,6 +1296,53 @@ extern "C" void app_main(void)
     ret = nvs_flash_init();
   }
   ESP_ERROR_CHECK(ret);
+
+  /* Load configuration */
+  ret = load_wifi_config(&stored_config);
+  if (ret != ESP_OK)
+  {
+    ESP_LOGI(TAG_MAIN, "╔════════════════════════════════════════╗");
+    ESP_LOGI(TAG_MAIN, "║  No Configuration Found                ║");
+    ESP_LOGI(TAG_MAIN, "║  Entering Setup Mode                   ║");
+    ESP_LOGI(TAG_MAIN, "╚════════════════════════════════════════╝");
+    ESP_LOGI(TAG_MAIN, "");
+    ESP_LOGI(TAG_MAIN, "Connect to WiFi: %s", DEFAULT_CONFIG_AP_SSID);
+    ESP_LOGI(TAG_MAIN, "Then visit: http://%s", WEB_CONFIG_IP);
+    ESP_LOGI(TAG_MAIN, "");
+
+    // Set temporary AP-only configuration
+    strncpy(stored_config.ap_ssid, DEFAULT_CONFIG_AP_SSID, sizeof(stored_config.ap_ssid));
+    strncpy(stored_config.ap_password, DEFAULT_CONFIG_AP_PASSWORD, sizeof(stored_config.ap_password));
+    stored_config.configured = false;
+    config_mode = true;
+
+    // Show on display
+    if (framebuffer)
+    {
+      lcd_fill_screen(TERM_BG);
+      lcd_fill_rect(0, 0, 240, 18, TERM_GREEN_DARK);
+      lcd_draw_string(40, 5, "SETUP MODE", TERM_GREEN, TERM_GREEN_DARK);
+
+      lcd_draw_string(5, 30, "WiFi:", TERM_GREEN_DIM, TERM_BG);
+      lcd_draw_string(5, 45, DEFAULT_CONFIG_AP_SSID, TERM_ACCENT, TERM_BG);
+
+      lcd_draw_string(5, 65, "Config IP:", TERM_GREEN_DIM, TERM_BG);
+      lcd_draw_string(5, 80, WEB_CONFIG_IP, TERM_GREEN, TERM_BG);
+
+      lcd_draw_string(5, 100, "Open browser and", TERM_GREEN_DIM, TERM_BG);
+      lcd_draw_string(5, 113, "visit IP above", TERM_GREEN_DIM, TERM_BG);
+      lcd_flush();
+    }
+  }
+  else
+  {
+    ESP_LOGI(TAG_MAIN, "✓ Configuration loaded:");
+    ESP_LOGI(TAG_MAIN, "  Uplink SSID: %s", stored_config.sta_ssid);
+    ESP_LOGI(TAG_MAIN, "  AP SSID: %s", stored_config.ap_ssid);
+    ESP_LOGI(TAG_MAIN, "  AP Security: %s",
+             strlen(stored_config.ap_password) > 0 ? "WPA2" : "Open");
+    config_mode = false;
+  }
 
   /* Initialize TCP/IP stack */
   ESP_ERROR_CHECK(esp_netif_init());
@@ -741,51 +1367,84 @@ extern "C" void app_main(void)
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-  /* Set AP+STA mode */
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-
-  /* Disable power saving for better performance */
-  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-  ESP_LOGI(TAG_MAIN, "✓ Power saving disabled for optimal performance");
-
-  /* Initialize AP and STA */
-  wifi_init_softap();
-  wifi_init_sta();
-
-  /* Start WiFi */
-  ESP_ERROR_CHECK(esp_wifi_start());
-  ESP_LOGI(TAG_MAIN, "✓ WiFi started in AP+STA mode");
-
-  /* Update display with initial status */
-  vTaskDelay(pdMS_TO_TICKS(1000)); // Wait a moment for display
-  display_update_status();
-
-  /* Wait for connection */
-  ESP_LOGI(TAG_MAIN, "Waiting for STA connection...");
-  EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                         pdFALSE,
-                                         pdFALSE,
-                                         portMAX_DELAY);
-
-  /* Check connection result */
-  if (bits & WIFI_CONNECTED_BIT)
+  if (config_mode)
   {
+    /* Config mode: AP only for configuration */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    wifi_init_softap();
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG_MAIN, "✓ WiFi started in AP-only mode (config mode)");
+
+    /* Start web server for configuration */
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    start_webserver();
+
     ESP_LOGI(TAG_MAIN, "╔═══════════════════════════════════════╗");
-    ESP_LOGI(TAG_MAIN, "║  ✓ WiFi Repeater Ready!              ║");
-    ESP_LOGI(TAG_MAIN, "║  Connect to: %-24s║", WIFI_AP_SSID);
-    ESP_LOGI(TAG_MAIN, "║  NAT Status: %-24s║", napt_enabled ? "ENABLED" : "PENDING");
+    ESP_LOGI(TAG_MAIN, "║  🔧 Configuration Mode Active         ║");
+    ESP_LOGI(TAG_MAIN, "║                                       ║");
+    ESP_LOGI(TAG_MAIN, "║  1. Connect to: %-21s║", stored_config.ap_ssid);
+    ESP_LOGI(TAG_MAIN, "║  2. Visit: http://%-19s║", WEB_CONFIG_IP);
+    ESP_LOGI(TAG_MAIN, "║  3. Configure WiFi settings           ║");
     ESP_LOGI(TAG_MAIN, "╚═══════════════════════════════════════╝");
 
-    /* Create status monitoring task */
-    xTaskCreate(status_task, "status_task", 4096, NULL, 5, NULL);
-  }
-  else if (bits & WIFI_FAIL_BIT)
-  {
-    ESP_LOGE(TAG_MAIN, "✗ Failed to connect to SSID:%s", WIFI_STA_SSID);
+    // Stay in config mode indefinitely
+    while (1)
+    {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
   }
   else
   {
-    ESP_LOGE(TAG_MAIN, "✗ Unexpected event");
+    /* Normal mode: AP+STA for repeater operation */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    /* Disable power saving for better performance */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_LOGI(TAG_MAIN, "✓ Power saving disabled for optimal performance");
+
+    /* Initialize AP and STA */
+    wifi_init_softap();
+    wifi_init_sta();
+
+    /* Start WiFi */
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG_MAIN, "✓ WiFi started in AP+STA mode");
+
+    /* Update display with initial status */
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    display_update_status();
+
+    /* Wait for connection */
+    ESP_LOGI(TAG_MAIN, "Waiting for STA connection...");
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           portMAX_DELAY);
+
+    /* Check connection result */
+    if (bits & WIFI_CONNECTED_BIT)
+    {
+      /* Start web server for easy reconfiguration */
+      start_webserver();
+
+      ESP_LOGI(TAG_MAIN, "╔═══════════════════════════════════════╗");
+      ESP_LOGI(TAG_MAIN, "║  ✓ CardRepeater Ready!               ║");
+      ESP_LOGI(TAG_MAIN, "║  Connect to: %-24s║", stored_config.ap_ssid);
+      ESP_LOGI(TAG_MAIN, "║  Config IP: %-26s║", WEB_CONFIG_IP);
+      ESP_LOGI(TAG_MAIN, "║  NAT Status: %-24s║", napt_enabled ? "ENABLED" : "PENDING");
+      ESP_LOGI(TAG_MAIN, "╚═══════════════════════════════════════╝");
+
+      /* Create status monitoring task */
+      xTaskCreate(status_task, "status_task", 4096, NULL, 5, NULL);
+    }
+    else if (bits & WIFI_FAIL_BIT)
+    {
+      ESP_LOGE(TAG_MAIN, "✗ Failed to connect to SSID:%s", stored_config.sta_ssid);
+    }
+    else
+    {
+      ESP_LOGE(TAG_MAIN, "✗ Unexpected event");
+    }
   }
 }
