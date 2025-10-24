@@ -119,9 +119,12 @@ static httpd_handle_t web_server = NULL;
 static bool config_mode = false;
 
 /**
- * RGB565 Color definitions (with byte swap for ST7789)
+ * RGB565 Color definitions (byte-swapped for ST7789)
  */
-#define RGB565(r, g, b) ((((r & 0xF8) | (g >> 5)) << 8) | (((g & 0x1C) << 3) | (b >> 3)))
+#define RGB565(r, g, b) ({                                              \
+  uint16_t rgb = ((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3)); \
+  ((rgb >> 8) | (rgb << 8));                                            \
+})
 #define COLOR_BLACK RGB565(0, 0, 0)
 #define COLOR_WHITE RGB565(255, 255, 255)
 #define COLOR_RED RGB565(255, 0, 0)
@@ -246,49 +249,139 @@ static uint16_t *framebuffer = NULL;
 /* ═══════════════════════════════════════════════════════════════════
  * WEB SERVER HTML PAGES
  * ═══════════════════════════════════════════════════════════════════ */
-static const char *html_config_page =
-    "<!DOCTYPE html>"
-    "<html><head>"
-    "<meta charset='UTF-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>CardRepeater Config</title>"
-    "<style>"
-    "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0}"
-    "h1{color:#333;text-align:center;background:#4CAF50;color:white;padding:15px;border-radius:5px}"
-    ".ip-banner{background:#2196F3;color:white;padding:10px;text-align:center;font-size:16px;font-weight:bold;border-radius:5px;margin-bottom:20px}"
-    "form{background:white;padding:20px;border-radius:5px;box-shadow:0 2px 4px rgba(0,0,0,0.1);max-width:500px;margin:20px auto}"
-    "label{display:block;margin:10px 0 5px;font-weight:bold;color:#555}"
-    "input{width:100%;padding:8px;margin-bottom:15px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}"
-    "button{background:#4CAF50;color:white;padding:12px 20px;border:none;border-radius:4px;cursor:pointer;width:100%;font-size:16px}"
-    "button:hover{background:#45a049}"
-    ".info{background:#e3f2fd;padding:10px;border-radius:4px;margin:10px 0;border-left:4px solid #2196F3}"
-    ".section{margin:20px 0;padding:15px;background:#fafafa;border-radius:4px}"
-    ".status{text-align:center;padding:10px;margin:10px 0;border-radius:4px}"
-    ".success{background:#d4edda;color:#155724;border:1px solid #c3e6cb}"
-    "</style></head><body>"
-    "<h1>CardRepeater Setup</h1>"
-    "<form action='/save' method='GET'>"
-    "<div class='section'>"
-    "<h2 style='color:#4CAF50;margin-top:0'>Uplink WiFi</h2>"
-    "<label>Network Name (SSID):</label>"
-    "<input type='text' name='sta_ssid' placeholder='Your WiFi network name' required>"
-    "<label>Password:</label>"
-    "<input type='password' name='sta_pass' placeholder='WiFi password'>"
-    "</div>"
-    "<div class='section'>"
-    "<h2 style='color:#4CAF50;margin-top:0'>Access Point</h2>"
-    "<label>AP Name (SSID):</label>"
-    "<input type='text' name='ap_ssid' placeholder='CardRepeater' required>"
-    "<label>AP Password:</label>"
-    "<input type='password' name='ap_pass' placeholder='Leave empty for open network'>"
-    "<div class='info'>Note: Password must be at least 8 characters or leave empty for open network</div>"
-    "</div>"
-    "<button type='submit'>Save & Restart</button>"
-    "</form>"
-    "<div class='status' style='background:#fff3cd;color:#856404;border:1px solid #ffeeba;margin-top:20px'>"
-    "Device will restart after saving configuration"
-    "</div>"
-    "</body></html>";
+
+/**
+ * Generate dynamic configuration page with prefilled values
+ */
+static void generate_config_html(char *buffer, size_t buffer_size, const repeater_config_t *config)
+{
+  // Escape HTML special characters in stored values
+  char escaped_sta_ssid[64] = {0};
+  char escaped_ap_ssid[64] = {0};
+
+  // Simple HTML escaping (replace & < > " ')
+  const char *src = config->sta_ssid;
+  char *dst = escaped_sta_ssid;
+  while (*src && (dst - escaped_sta_ssid) < (int)sizeof(escaped_sta_ssid) - 6)
+  {
+    if (*src == '&')
+    {
+      strcpy(dst, "&amp;");
+      dst += 5;
+    }
+    else if (*src == '<')
+    {
+      strcpy(dst, "&lt;");
+      dst += 4;
+    }
+    else if (*src == '>')
+    {
+      strcpy(dst, "&gt;");
+      dst += 4;
+    }
+    else if (*src == '"')
+    {
+      strcpy(dst, "&quot;");
+      dst += 6;
+    }
+    else if (*src == '\'')
+    {
+      strcpy(dst, "&#39;");
+      dst += 5;
+    }
+    else
+    {
+      *dst++ = *src;
+    }
+    src++;
+  }
+  *dst = '\0';
+
+  src = config->ap_ssid;
+  dst = escaped_ap_ssid;
+  while (*src && (dst - escaped_ap_ssid) < (int)sizeof(escaped_ap_ssid) - 6)
+  {
+    if (*src == '&')
+    {
+      strcpy(dst, "&amp;");
+      dst += 5;
+    }
+    else if (*src == '<')
+    {
+      strcpy(dst, "&lt;");
+      dst += 4;
+    }
+    else if (*src == '>')
+    {
+      strcpy(dst, "&gt;");
+      dst += 4;
+    }
+    else if (*src == '"')
+    {
+      strcpy(dst, "&quot;");
+      dst += 6;
+    }
+    else if (*src == '\'')
+    {
+      strcpy(dst, "&#39;");
+      dst += 5;
+    }
+    else
+    {
+      *dst++ = *src;
+    }
+    src++;
+  }
+  *dst = '\0';
+
+  snprintf(buffer, buffer_size,
+           "<!DOCTYPE html>"
+           "<html><head>"
+           "<meta charset='UTF-8'>"
+           "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+           "<title>CardRepeater Config</title>"
+           "<style>"
+           "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0}"
+           "h1{color:#333;text-align:center;background:#4CAF50;color:white;padding:15px;border-radius:5px}"
+           ".ip-banner{background:#2196F3;color:white;padding:10px;text-align:center;font-size:16px;font-weight:bold;border-radius:5px;margin-bottom:20px}"
+           "form{background:white;padding:20px;border-radius:5px;box-shadow:0 2px 4px rgba(0,0,0,0.1);max-width:500px;margin:20px auto}"
+           "label{display:block;margin:10px 0 5px;font-weight:bold;color:#555}"
+           "input{width:100%%;padding:8px;margin-bottom:15px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}"
+           "button{background:#4CAF50;color:white;padding:12px 20px;border:none;border-radius:4px;cursor:pointer;width:100%%;font-size:16px}"
+           "button:hover{background:#45a049}"
+           ".info{background:#e3f2fd;padding:10px;border-radius:4px;margin:10px 0;border-left:4px solid #2196F3}"
+           ".section{margin:20px 0;padding:15px;background:#fafafa;border-radius:4px}"
+           ".status{text-align:center;padding:10px;margin:10px 0;border-radius:4px}"
+           ".success{background:#d4edda;color:#155724;border:1px solid #c3e6cb}"
+           "</style></head><body>"
+           "<h1>CardRepeater Setup</h1>"
+           "<form action='/save' method='GET'>"
+           "<div class='section'>"
+           "<h2 style='color:#4CAF50;margin-top:0'>Uplink WiFi</h2>"
+           "<label>Network Name (SSID):</label>"
+           "<input type='text' name='sta_ssid' value='%s' placeholder='Your WiFi network name' required>"
+           "<label>Password:</label>"
+           "<input type='password' name='sta_pass' placeholder='%s'>"
+           "</div>"
+           "<div class='section'>"
+           "<h2 style='color:#4CAF50;margin-top:0'>Access Point</h2>"
+           "<label>AP Name (SSID):</label>"
+           "<input type='text' name='ap_ssid' value='%s' placeholder='CardRepeater' required>"
+           "<label>AP Password:</label>"
+           "<input type='password' name='ap_pass' placeholder='%s'>"
+           "<div class='info'>Note: Password must be at least 8 characters or leave empty for open network</div>"
+           "</div>"
+           "<button type='submit'>Save & Restart</button>"
+           "</form>"
+           "<div class='status' style='background:#fff3cd;color:#856404;border:1px solid #ffeeba;margin-top:20px'>"
+           "Device will restart after saving configuration"
+           "</div>"
+           "</body></html>",
+           escaped_sta_ssid,
+           strlen(config->sta_password) > 0 ? "Leave blank to keep current" : "WiFi password",
+           escaped_ap_ssid,
+           strlen(config->ap_password) > 0 ? "Leave blank to keep current or empty for open" : "Leave empty for open network");
+}
 
 static const char *html_success_page =
     "<!DOCTYPE html>"
@@ -443,7 +536,7 @@ static void display_init(void)
   // Configure LCD panel
   esp_lcd_panel_dev_config_t panel_config = {
       .reset_gpio_num = LCD_RST_PIN,
-      .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+      .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
       .bits_per_pixel = 16,
   };
   ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io_handle, &panel_config, &lcd_panel_handle));
@@ -684,8 +777,23 @@ static esp_err_t clear_wifi_config(void)
  */
 static esp_err_t root_handler(httpd_req_t *req)
 {
+  // Allocate buffer for HTML page (larger to avoid truncation)
+  char *html_buffer = (char *)malloc(4096);
+  if (!html_buffer)
+  {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
+    return ESP_FAIL;
+  }
+
+  // Generate HTML with current configuration
+  generate_config_html(html_buffer, 4096, &stored_config);
+
+  // Send response
   httpd_resp_set_type(req, "text/html");
-  httpd_resp_send(req, html_config_page, HTTPD_RESP_USE_STRLEN);
+  httpd_resp_send(req, html_buffer, HTTPD_RESP_USE_STRLEN);
+
+  // Free buffer
+  free(html_buffer);
   return ESP_OK;
 }
 
@@ -706,8 +814,8 @@ static esp_err_t save_handler(httpd_req_t *req)
 
   ESP_LOGI(TAG_MAIN, "Received config query");
 
-  // Parse query parameters
-  repeater_config_t new_config = {0};
+  // Parse query parameters - start with existing config to preserve passwords if left blank
+  repeater_config_t new_config = stored_config;
 
   if (!parse_query_param(query, "sta_ssid", new_config.sta_ssid, sizeof(new_config.sta_ssid)))
   {
@@ -715,7 +823,12 @@ static esp_err_t save_handler(httpd_req_t *req)
     return ESP_FAIL;
   }
 
-  parse_query_param(query, "sta_pass", new_config.sta_password, sizeof(new_config.sta_password));
+  // Parse password, but only update if not empty
+  char temp_pass[64] = {0};
+  if (parse_query_param(query, "sta_pass", temp_pass, sizeof(temp_pass)) && strlen(temp_pass) > 0)
+  {
+    strncpy(new_config.sta_password, temp_pass, sizeof(new_config.sta_password));
+  }
 
   if (!parse_query_param(query, "ap_ssid", new_config.ap_ssid, sizeof(new_config.ap_ssid)))
   {
@@ -723,13 +836,26 @@ static esp_err_t save_handler(httpd_req_t *req)
     return ESP_FAIL;
   }
 
-  parse_query_param(query, "ap_pass", new_config.ap_password, sizeof(new_config.ap_password));
-
-  // Validate AP password (must be 8+ chars or empty)
-  if (strlen(new_config.ap_password) > 0 && strlen(new_config.ap_password) < 8)
+  // Parse AP password, but only update if not empty (unless it was previously empty)
+  memset(temp_pass, 0, sizeof(temp_pass));
+  if (parse_query_param(query, "ap_pass", temp_pass, sizeof(temp_pass)))
   {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "AP password must be at least 8 characters or empty");
-    return ESP_FAIL;
+    // If new password provided, validate it
+    if (strlen(temp_pass) > 0)
+    {
+      if (strlen(temp_pass) < 8)
+      {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "AP password must be at least 8 characters or empty");
+        return ESP_FAIL;
+      }
+      strncpy(new_config.ap_password, temp_pass, sizeof(new_config.ap_password));
+    }
+    // If empty and user explicitly wants open network, clear password
+    else if (strlen(stored_config.ap_password) == 0)
+    {
+      memset(new_config.ap_password, 0, sizeof(new_config.ap_password));
+    }
+    // Otherwise keep existing password
   }
 
   new_config.configured = true;
@@ -914,18 +1040,18 @@ static void display_update_status(void)
     else if (sta_connected)
     {
       lcd_draw_string(203, uplink_y + 3, "...", TERM_GREEN_DIM, TERM_BG);
-      draw_circle(228, uplink_y + 7, 5, RGB565(200, 200, 0)); // Yellow = Connected, checking...
+      draw_circle(228, uplink_y + 7, 5, RGB565(0, 200, 200)); // Yellow = Connected, checking...
     }
     else
     {
-      draw_circle(228, uplink_y + 7, 5, RGB565(200, 0, 0)); // Red = Disconnected
+      draw_circle(228, uplink_y + 7, 5, RGB565(0, 0, 200)); // Red = Disconnected
     }
   }
   else
   {
     // Disconnected state
     lcd_draw_string(6, uplink_y + 14, "Searching...", TERM_GREEN_DIM, TERM_BG);
-    draw_circle(228, uplink_y + 7, 5, RGB565(200, 0, 0)); // Red = Disconnected
+    draw_circle(228, uplink_y + 7, 5, RGB565(0, 0, 200)); // Red = Disconnected
   }
 
   // ═══════════════════════════════════════════════════════════
