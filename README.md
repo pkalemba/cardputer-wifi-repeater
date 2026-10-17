@@ -17,15 +17,29 @@
 ### 🔌 Core Functionality
 - **WiFi Repeater**: Extends your WiFi network range with NAPT (Network Address Port Translation)
 - **Dual Mode Operation**: Functions as both Station (uplink) and Access Point simultaneously
-- **Internet Connectivity Check**: Automatic ping tests to verify real internet access
+- **Internet Connectivity Check**: HTTP probe (`generate_204`) verifies real internet access
 - **DNS Forwarding**: Seamlessly forwards DNS queries from clients to upstream network
+
+### 🔐 WireGuard VPN
+- **Full tunnel**: all client traffic (`0.0.0.0/0`) is routed through a WireGuard peer
+- **Automatic time sync** (SNTP) before the handshake - required by WireGuard
+- **Portal aware**: the tunnel takes over routing only once the uplink has real internet access, so hotel/airport login pages stay reachable
+- **Optional VPN DNS** offered to clients via DHCP
+
+### 🏨 Captive Portal Support
+- **Uplink portal detection**: recognizes hotel/airport login pages and shows `LOGIN` on the display; the web UI links to the login page. Signing in once from any client unlocks internet for all clients (they share the repeater's address)
+- **Setup captive portal**: in setup mode every DNS name resolves to the repeater, so phones and laptops open the configuration page automatically
+
+### 📡 WiFi Scanning
+- **Network picker** in the web UI - press *Scan* and tap a network instead of typing the SSID
 
 ### 🖥️ Terminal UI
 - **Retro CRT Green Theme**: Classic terminal aesthetics on the Cardputer's LCD
 - **Real-time Status Display**: 
   - 🟢 Uplink connection status with RSSI signal strength
   - 📶 Live client count
-  - 🌐 Internet connectivity indicator (Green/Yellow/Red)
+  - 🌐 Internet connectivity indicator (Green = online, Yellow = checking, Orange + `LOGIN` = captive portal, Red = offline)
+  - 🔐 VPN status (`VPN:ON` / `VPN:RDY` / `VPN:..`)
 
 ### ⚙️ Web Configuration
 - **Easy Setup**: Web-UI based configuration interface (because I couldn't get the built in keyboard working)
@@ -60,8 +74,8 @@
 3. **First-time setup**
    - Device will boot into **Setup Mode** (no configuration found)
    - Connect to WiFi network: `CardRepeater`
-   - Open browser and navigate to: `http://192.168.4.1`
-   - Configure your WiFi settings
+   - The setup page should open automatically (captive portal); otherwise navigate to `http://192.168.4.1`
+   - Press **Scan** to pick your WiFi network and enter its password
    - Device will restart and begin repeating
 
 ## 🎮 Usage
@@ -75,10 +89,11 @@ When powered on for the first time:
    - The Cardputer display will show setup instructions
 
 2. **Access Web Interface**
-   - Open browser: `http://192.168.4.1`
+   - Opens automatically on most devices, or browse to `http://192.168.4.1`
    - Enter your settings:
-     - **Uplink WiFi**: Network to connect to (internet source)
+     - **Uplink WiFi**: Network to connect to (internet source) - use **Scan** to list nearby networks
      - **Access Point**: Your repeater's network name and password
+     - **WireGuard VPN** (optional): see below
 
 3. **Save & Restart**
    - Device automatically reboots into repeater mode
@@ -90,6 +105,38 @@ After configuration:
 - Creates access point for client devices
 - Display shows live status information
 - Web interface remains accessible at `192.168.4.1` for reconfiguration
+
+### Captive Portals (hotels, airports, trains)
+
+When the uplink network requires a login, the display shows an orange dot with `LOGIN`.
+Connect any device to the repeater, open `http://192.168.4.1` and follow the
+**Open the login page** link (or open any `http://` page). After logging in, the
+status changes to online within ~10 seconds and all clients share the access.
+
+### WireGuard VPN
+
+Fill in the **WireGuard VPN** section of the web interface with values from your
+WireGuard client config:
+
+| Web UI field | WireGuard config |
+|---|---|
+| Interface Address | `[Interface] Address`, e.g. `10.6.0.2/32` |
+| Private Key | `[Interface] PrivateKey` |
+| Peer Public Key | `[Peer] PublicKey` |
+| Preshared Key | `[Peer] PresharedKey` (optional, enter `-` to remove a stored one) |
+| Endpoint / Port | `[Peer] Endpoint` host and port |
+| Persistent Keepalive | `[Peer] PersistentKeepalive` (default 25) |
+| DNS for clients | `[Interface] DNS` (optional, empty = uplink DNS) |
+
+On the server the peer needs `AllowedIPs = <interface address>/32`. The server must
+forward/NAT traffic from the tunnel to the internet (as for any full-tunnel client).
+
+Notes:
+- Client traffic goes directly through the uplink until the handshake succeeds,
+  and while a captive portal requires login - there is no kill switch.
+- The tunnel MTU is 1420. If some websites hang on large transfers, lower the MTU
+  of your client devices to 1420.
+- Only IPv4 and one peer are supported.
 
 ### Building from Source
 
@@ -126,7 +173,9 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ### Ideas for Contributions
 - [ ] Add button controls for configuring wifi
-- [ ] Implement WiFi scanning and network selection
+- [x] Implement WiFi scanning and network selection
+- [x] WireGuard VPN
+- [x] Captive portal support
 - [ ] Add bandwidth usage statistics
 - [ ] Custom themes (amber, blue, etc.)
 

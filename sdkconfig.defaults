@@ -15,3 +15,12 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # Enable console for debugging
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# Web server: captive portal probes (e.g. iOS) send long headers
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# More sockets for web server + captive DNS + connectivity probe
+CONFIG_LWIP_MAX_SOCKETS=16
+
+# WireGuard crypto (handshake) runs in the TCP/IP task
+CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=6144

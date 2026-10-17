@@ -6,10 +6,17 @@
  * - Connects to an upstream WiFi network (Station mode)
  * - Provides an Access Point for clients
  * - Routes traffic between them using NAPT
+ * - Optionally tunnels all client traffic through WireGuard
+ * - Detects captive portals on the uplink network
+ * - Acts as a captive portal itself while in setup mode
  */
 
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -24,8 +31,14 @@
 #include "lwip/err.h"
 #include "lwip/sys.h"
 #include "lwip/lwip_napt.h"
+#include "lwip/sockets.h"
+#include "lwip/ip4_addr.h"
 #include "dhcpserver/dhcpserver.h"
-#include "ping/ping_sock.h"
+#include "esp_netif_sntp.h"
+#include "esp_http_client.h"
+
+// WireGuard
+#include "esp_wireguard.h"
 
 // Display includes
 #include "driver/spi_master.h"
@@ -57,6 +70,20 @@
 #define NVS_KEY_STA_PASS "sta_pass"
 #define NVS_KEY_AP_SSID "ap_ssid"
 #define NVS_KEY_AP_PASS "ap_pass"
+#define NVS_KEY_WG_ENABLED "wg_en"
+#define NVS_KEY_WG_PRIVATE_KEY "wg_priv"
+#define NVS_KEY_WG_ADDRESS "wg_addr"
+#define NVS_KEY_WG_PEER_KEY "wg_peer"
+#define NVS_KEY_WG_PSK "wg_psk"
+#define NVS_KEY_WG_ENDPOINT "wg_host"
+#define NVS_KEY_WG_PORT "wg_port"
+#define NVS_KEY_WG_KEEPALIVE "wg_ka"
+#define NVS_KEY_WG_DNS "wg_dns"
+
+/* WireGuard defaults */
+#define WG_DEFAULT_PORT 51820
+#define WG_DEFAULT_KEEPALIVE 25
+#define WG_KEY_B64_LEN 44 // base64 of a 32 byte key
 
 /* Configuration storage */
 typedef struct
@@ -66,6 +93,17 @@ typedef struct
   char ap_ssid[32];
   char ap_password[64];
   bool configured;
+
+  /* WireGuard (optional) */
+  bool wg_enabled;
+  char wg_private_key[WG_KEY_B64_LEN + 1];
+  char wg_address[20]; // CIDR, e.g. 10.6.0.2/32
+  char wg_peer_public_key[WG_KEY_B64_LEN + 1];
+  char wg_preshared_key[WG_KEY_B64_LEN + 1];
+  char wg_endpoint[64];
+  uint16_t wg_port;
+  uint16_t wg_keepalive;
+  char wg_dns[16]; // DNS offered to AP clients when VPN is enabled (empty = upstream)
 } repeater_config_t;
 
 static repeater_config_t stored_config = {0};
@@ -89,10 +127,37 @@ static int s_retry_num = 0;
 static esp_netif_t *sta_netif = NULL;
 static esp_netif_t *ap_netif = NULL;
 
+/* Uplink connectivity state (result of the captive portal probe) */
+typedef enum
+{
+  UPLINK_OFFLINE,  // No STA connection or no response
+  UPLINK_CHECKING, // Connected, probe pending
+  UPLINK_PORTAL,   // Captive portal intercepts traffic - login required
+  UPLINK_ONLINE    // Real internet access confirmed
+} uplink_state_t;
+
+/* Captive portal probe: returns HTTP 204 only with real internet access */
+#define CONNECTIVITY_CHECK_URL "http://connectivitycheck.gstatic.com/generate_204"
+#define PORTAL_FALLBACK_URL "http://neverssl.com/"
+
 /* Status tracking */
 static bool sta_connected = false;
 static bool napt_enabled = false;
-static bool internet_connected = false;
+static uplink_state_t uplink_state = UPLINK_OFFLINE;
+static char portal_url[256] = {0};
+
+/* WireGuard state */
+static wireguard_config_t wg_config = {};
+static wireguard_ctx_t wg_ctx = {};
+static char wg_ip[16] = {0};
+static char wg_netmask[16] = {0};
+static bool wg_initialized = false;
+static bool wg_connected = false;
+static bool wg_peer_up = false;
+static bool wg_is_default = false;
+
+/* Status task handle (notified on uplink changes) */
+static TaskHandle_t status_task_handle = NULL;
 
 /* M5Stack Cardputer Display Pin Configuration */
 #define LCD_MOSI_PIN 35 // DATA
@@ -251,136 +316,228 @@ static uint16_t *framebuffer = NULL;
  * ═══════════════════════════════════════════════════════════════════ */
 
 /**
- * Generate dynamic configuration page with prefilled values
+ * Send a string as an HTML-escaped response chunk
  */
-static void generate_config_html(char *buffer, size_t buffer_size, const repeater_config_t *config)
+static void send_html_escaped(httpd_req_t *req, const char *src)
 {
-  // Escape HTML special characters in stored values
-  char escaped_sta_ssid[64] = {0};
-  char escaped_ap_ssid[64] = {0};
-
-  // Simple HTML escaping (replace & < > " ')
-  const char *src = config->sta_ssid;
-  char *dst = escaped_sta_ssid;
-  while (*src && (dst - escaped_sta_ssid) < (int)sizeof(escaped_sta_ssid) - 6)
+  char buf[64];
+  size_t pos = 0;
+  while (*src)
   {
-    if (*src == '&')
+    const char *rep = NULL;
+    switch (*src)
     {
-      strcpy(dst, "&amp;");
-      dst += 5;
+    case '&':
+      rep = "&amp;";
+      break;
+    case '<':
+      rep = "&lt;";
+      break;
+    case '>':
+      rep = "&gt;";
+      break;
+    case '"':
+      rep = "&quot;";
+      break;
+    case '\'':
+      rep = "&#39;";
+      break;
     }
-    else if (*src == '<')
+    size_t need = rep ? strlen(rep) : 1;
+    if (pos + need >= sizeof(buf))
     {
-      strcpy(dst, "&lt;");
-      dst += 4;
+      httpd_resp_send_chunk(req, buf, pos);
+      pos = 0;
     }
-    else if (*src == '>')
+    if (rep)
     {
-      strcpy(dst, "&gt;");
-      dst += 4;
-    }
-    else if (*src == '"')
-    {
-      strcpy(dst, "&quot;");
-      dst += 6;
-    }
-    else if (*src == '\'')
-    {
-      strcpy(dst, "&#39;");
-      dst += 5;
+      memcpy(buf + pos, rep, need);
+      pos += need;
     }
     else
     {
-      *dst++ = *src;
+      buf[pos++] = *src;
     }
     src++;
   }
-  *dst = '\0';
+  if (pos > 0)
+    httpd_resp_send_chunk(req, buf, pos);
+}
 
-  src = config->ap_ssid;
-  dst = escaped_ap_ssid;
-  while (*src && (dst - escaped_ap_ssid) < (int)sizeof(escaped_ap_ssid) - 6)
+static const char *html_page_head =
+    "<!DOCTYPE html>"
+    "<html><head>"
+    "<meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>CardRepeater Config</title>"
+    "<style>"
+    "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0}"
+    "h1{color:#333;text-align:center;background:#4CAF50;color:white;padding:15px;border-radius:5px}"
+    "form{background:white;padding:20px;border-radius:5px;box-shadow:0 2px 4px rgba(0,0,0,0.1);max-width:500px;margin:20px auto}"
+    "label{display:block;margin:10px 0 5px;font-weight:bold;color:#555}"
+    "input{width:100%;padding:8px;margin-bottom:15px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}"
+    "input[type=checkbox]{width:auto;margin:0 8px 0 0}"
+    "button{background:#4CAF50;color:white;padding:12px 20px;border:none;border-radius:4px;cursor:pointer;width:100%;font-size:16px}"
+    "button:hover{background:#45a049}"
+    ".row{display:flex;gap:8px}.row input{flex:1}.row button{width:auto;padding:8px 14px;margin-bottom:15px;font-size:14px}"
+    ".net{padding:8px;margin:0 0 4px;background:#e8f5e9;border-radius:4px;cursor:pointer;font-size:14px}"
+    ".net:hover{background:#c8e6c9}"
+    ".info{background:#e3f2fd;padding:10px;border-radius:4px;margin:10px 0;border-left:4px solid #2196F3}"
+    ".section{margin:20px 0;padding:15px;background:#fafafa;border-radius:4px}"
+    ".status{text-align:center;padding:10px;margin:10px auto;border-radius:4px;max-width:520px}"
+    ".ok{background:#d4edda;color:#155724;border:1px solid #c3e6cb}"
+    ".warn{background:#fff3cd;color:#856404;border:1px solid #ffeeba}"
+    ".err{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb}"
+    "</style></head><body>"
+    "<h1>CardRepeater Setup</h1>";
+
+static const char *html_page_script =
+    "<script>"
+    "function scan(){"
+    "var n=document.getElementById('nets');n.textContent='Scanning...';"
+    "fetch('/scan').then(function(r){if(!r.ok)throw r.status;return r.json()}).then(function(l){"
+    "n.textContent='';"
+    "if(!l.length){n.textContent='No networks found';return}"
+    "l.forEach(function(a){var d=document.createElement('div');d.className='net';"
+    "d.textContent=(a.auth?'\\uD83D\\uDD12 ':'')+a.ssid+'  ('+a.rssi+' dBm, ch '+a.ch+')';"
+    "d.onclick=function(){document.getElementById('sta_ssid').value=a.ssid;n.textContent=''};"
+    "n.appendChild(d)})"
+    "}).catch(function(e){n.textContent='Scan failed ('+e+') - uplink may be busy connecting, try again'})}"
+    "</script>";
+
+/**
+ * Send the uplink / VPN status box (normal mode only)
+ */
+static void send_status_html(httpd_req_t *req)
+{
+  if (config_mode)
+    return;
+
+  switch (uplink_state)
   {
-    if (*src == '&')
-    {
-      strcpy(dst, "&amp;");
-      dst += 5;
-    }
-    else if (*src == '<')
-    {
-      strcpy(dst, "&lt;");
-      dst += 4;
-    }
-    else if (*src == '>')
-    {
-      strcpy(dst, "&gt;");
-      dst += 4;
-    }
-    else if (*src == '"')
-    {
-      strcpy(dst, "&quot;");
-      dst += 6;
-    }
-    else if (*src == '\'')
-    {
-      strcpy(dst, "&#39;");
-      dst += 5;
-    }
-    else
-    {
-      *dst++ = *src;
-    }
-    src++;
+  case UPLINK_ONLINE:
+    httpd_resp_sendstr_chunk(req, "<div class='status ok'>Uplink: online");
+    break;
+  case UPLINK_PORTAL:
+    httpd_resp_sendstr_chunk(req, "<div class='status warn'><b>Captive portal detected</b> on the uplink network.<br>"
+                                  "<a href='");
+    send_html_escaped(req, strlen(portal_url) > 0 ? portal_url : PORTAL_FALLBACK_URL);
+    httpd_resp_sendstr_chunk(req, "' target='_blank'>Open the login page</a> - signing in once unlocks internet for all clients.");
+    break;
+  case UPLINK_CHECKING:
+    httpd_resp_sendstr_chunk(req, "<div class='status warn'>Uplink: connected, checking internet...");
+    break;
+  default:
+    httpd_resp_sendstr_chunk(req, "<div class='status err'>Uplink: offline");
+    break;
   }
-  *dst = '\0';
 
-  snprintf(buffer, buffer_size,
-           "<!DOCTYPE html>"
-           "<html><head>"
-           "<meta charset='UTF-8'>"
-           "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-           "<title>CardRepeater Config</title>"
-           "<style>"
-           "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0}"
-           "h1{color:#333;text-align:center;background:#4CAF50;color:white;padding:15px;border-radius:5px}"
-           ".ip-banner{background:#2196F3;color:white;padding:10px;text-align:center;font-size:16px;font-weight:bold;border-radius:5px;margin-bottom:20px}"
-           "form{background:white;padding:20px;border-radius:5px;box-shadow:0 2px 4px rgba(0,0,0,0.1);max-width:500px;margin:20px auto}"
-           "label{display:block;margin:10px 0 5px;font-weight:bold;color:#555}"
-           "input{width:100%%;padding:8px;margin-bottom:15px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}"
-           "button{background:#4CAF50;color:white;padding:12px 20px;border:none;border-radius:4px;cursor:pointer;width:100%%;font-size:16px}"
-           "button:hover{background:#45a049}"
-           ".info{background:#e3f2fd;padding:10px;border-radius:4px;margin:10px 0;border-left:4px solid #2196F3}"
-           ".section{margin:20px 0;padding:15px;background:#fafafa;border-radius:4px}"
-           ".status{text-align:center;padding:10px;margin:10px 0;border-radius:4px}"
-           ".success{background:#d4edda;color:#155724;border:1px solid #c3e6cb}"
-           "</style></head><body>"
-           "<h1>CardRepeater Setup</h1>"
-           "<form action='/save' method='GET'>"
-           "<div class='section'>"
-           "<h2 style='color:#4CAF50;margin-top:0'>Uplink WiFi</h2>"
-           "<label>Network Name (SSID):</label>"
-           "<input type='text' name='sta_ssid' value='%s' placeholder='Your WiFi network name' required>"
-           "<label>Password:</label>"
-           "<input type='password' name='sta_pass' placeholder='%s'>"
-           "</div>"
-           "<div class='section'>"
-           "<h2 style='color:#4CAF50;margin-top:0'>Access Point</h2>"
-           "<label>AP Name (SSID):</label>"
-           "<input type='text' name='ap_ssid' value='%s' placeholder='CardRepeater' required>"
-           "<label>AP Password:</label>"
-           "<input type='password' name='ap_pass' placeholder='%s'>"
-           "<div class='info'>Note: Password must be at least 8 characters or leave empty for open network</div>"
-           "</div>"
-           "<button type='submit'>Save & Restart</button>"
-           "</form>"
-           "<div class='status' style='background:#fff3cd;color:#856404;border:1px solid #ffeeba;margin-top:20px'>"
-           "Device will restart after saving configuration"
-           "</div>"
-           "</body></html>",
-           escaped_sta_ssid,
-           strlen(config->sta_password) > 0 ? "Leave blank to keep current" : "WiFi password",
-           escaped_ap_ssid,
-           strlen(config->ap_password) > 0 ? "Leave blank to keep current or empty for open" : "Leave empty for open network");
+  if (stored_config.wg_enabled)
+  {
+    if (wg_is_default)
+      httpd_resp_sendstr_chunk(req, "<br>WireGuard: tunnel up, all client traffic is routed through VPN");
+    else if (wg_peer_up)
+      httpd_resp_sendstr_chunk(req, "<br>WireGuard: handshake OK, waiting for uplink");
+    else
+      httpd_resp_sendstr_chunk(req, "<br>WireGuard: connecting...");
+  }
+  httpd_resp_sendstr_chunk(req, "</div>");
+}
+
+/**
+ * Send the configuration page with prefilled values (chunked)
+ */
+static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
+{
+  char num[8];
+
+  httpd_resp_sendstr_chunk(req, html_page_head);
+  send_status_html(req);
+
+  httpd_resp_sendstr_chunk(req,
+                           "<form action='/save' method='POST'>"
+                           "<div class='section'>"
+                           "<h2 style='color:#4CAF50;margin-top:0'>Uplink WiFi</h2>"
+                           "<label>Network Name (SSID):</label>"
+                           "<div class='row'><input type='text' id='sta_ssid' name='sta_ssid' value='");
+  send_html_escaped(req, config->sta_ssid);
+  httpd_resp_sendstr_chunk(req,
+                           "' placeholder='Your WiFi network name' required>"
+                           "<button type='button' onclick='scan()'>Scan</button></div>"
+                           "<div id='nets'></div>"
+                           "<label>Password:</label>"
+                           "<input type='password' name='sta_pass' placeholder='");
+  httpd_resp_sendstr_chunk(req, strlen(config->sta_password) > 0 ? "Leave blank to keep current" : "WiFi password");
+  httpd_resp_sendstr_chunk(req,
+                           "'></div>"
+                           "<div class='section'>"
+                           "<h2 style='color:#4CAF50;margin-top:0'>Access Point</h2>"
+                           "<label>AP Name (SSID):</label>"
+                           "<input type='text' name='ap_ssid' value='");
+  send_html_escaped(req, config->ap_ssid);
+  httpd_resp_sendstr_chunk(req,
+                           "' placeholder='CardRepeater' required>"
+                           "<label>AP Password:</label>"
+                           "<input type='password' name='ap_pass' placeholder='");
+  httpd_resp_sendstr_chunk(req, strlen(config->ap_password) > 0 ? "Leave blank to keep current or empty for open" : "Leave empty for open network");
+  httpd_resp_sendstr_chunk(req,
+                           "'><div class='info'>Note: Password must be at least 8 characters or leave empty for open network</div>"
+                           "</div>"
+                           "<div class='section'>"
+                           "<h2 style='color:#4CAF50;margin-top:0'>WireGuard VPN</h2>"
+                           "<label><input type='checkbox' name='wg_en' value='1'");
+  if (config->wg_enabled)
+    httpd_resp_sendstr_chunk(req, " checked");
+  httpd_resp_sendstr_chunk(req,
+                           ">Route all client traffic through WireGuard</label>"
+                           "<label>Interface Address:</label>"
+                           "<input type='text' name='wg_addr' value='");
+  send_html_escaped(req, config->wg_address);
+  httpd_resp_sendstr_chunk(req,
+                           "' placeholder='10.6.0.2/32'>"
+                           "<label>Private Key:</label>"
+                           "<input type='password' name='wg_priv' placeholder='");
+  httpd_resp_sendstr_chunk(req, strlen(config->wg_private_key) > 0 ? "Leave blank to keep current" : "Output of wg genkey");
+  httpd_resp_sendstr_chunk(req,
+                           "'><label>Peer Public Key:</label>"
+                           "<input type='text' name='wg_peer' value='");
+  send_html_escaped(req, config->wg_peer_public_key);
+  httpd_resp_sendstr_chunk(req,
+                           "' placeholder='Server public key'>"
+                           "<label>Preshared Key (optional):</label>"
+                           "<input type='password' name='wg_psk' placeholder='");
+  httpd_resp_sendstr_chunk(req, strlen(config->wg_preshared_key) > 0 ? "Blank keeps current, - removes it" : "Leave empty if not used");
+  httpd_resp_sendstr_chunk(req,
+                           "'><label>Endpoint (host):</label>"
+                           "<input type='text' name='wg_host' value='");
+  send_html_escaped(req, config->wg_endpoint);
+  httpd_resp_sendstr_chunk(req,
+                           "' placeholder='vpn.example.com'>"
+                           "<label>Endpoint Port:</label>"
+                           "<input type='number' name='wg_port' min='1' max='65535' value='");
+  snprintf(num, sizeof(num), "%u", config->wg_port);
+  httpd_resp_sendstr_chunk(req, num);
+  httpd_resp_sendstr_chunk(req,
+                           "'><label>Persistent Keepalive (seconds):</label>"
+                           "<input type='number' name='wg_ka' min='1' max='65535' value='");
+  snprintf(num, sizeof(num), "%u", config->wg_keepalive);
+  httpd_resp_sendstr_chunk(req, num);
+  httpd_resp_sendstr_chunk(req,
+                           "'><label>DNS for clients (optional):</label>"
+                           "<input type='text' name='wg_dns' value='");
+  send_html_escaped(req, config->wg_dns);
+  httpd_resp_sendstr_chunk(req,
+                           "' placeholder='e.g. 1.1.1.1 (empty = uplink DNS)'>"
+                           "<div class='info'>The tunnel uses AllowedIPs 0.0.0.0/0. Traffic switches to the VPN "
+                           "after a successful handshake and while the uplink has internet access "
+                           "(not during captive portal login).</div>"
+                           "</div>"
+                           "<button type='submit'>Save & Restart</button>"
+                           "</form>"
+                           "<div class='status warn'>Device will restart after saving configuration</div>");
+  httpd_resp_sendstr_chunk(req, html_page_script);
+  httpd_resp_sendstr_chunk(req, "</body></html>");
+  httpd_resp_sendstr_chunk(req, NULL);
 }
 
 static const char *html_success_page =
@@ -653,7 +810,14 @@ static bool parse_query_param(const char *query, const char *field_name, char *o
   char search_key[64];
   snprintf(search_key, sizeof(search_key), "%s=", field_name);
 
-  const char *start = strstr(query, search_key);
+  // Match only whole field names (at the start or right after '&')
+  const char *start = query;
+  while ((start = strstr(start, search_key)) != NULL)
+  {
+    if (start == query || start[-1] == '&')
+      break;
+    start++;
+  }
   if (!start)
     return false;
 
@@ -696,6 +860,16 @@ static esp_err_t save_wifi_config(const repeater_config_t *config)
   nvs_set_str(nvs_handle, NVS_KEY_STA_PASS, config->sta_password);
   nvs_set_str(nvs_handle, NVS_KEY_AP_SSID, config->ap_ssid);
   nvs_set_str(nvs_handle, NVS_KEY_AP_PASS, config->ap_password);
+
+  nvs_set_u8(nvs_handle, NVS_KEY_WG_ENABLED, config->wg_enabled ? 1 : 0);
+  nvs_set_str(nvs_handle, NVS_KEY_WG_PRIVATE_KEY, config->wg_private_key);
+  nvs_set_str(nvs_handle, NVS_KEY_WG_ADDRESS, config->wg_address);
+  nvs_set_str(nvs_handle, NVS_KEY_WG_PEER_KEY, config->wg_peer_public_key);
+  nvs_set_str(nvs_handle, NVS_KEY_WG_PSK, config->wg_preshared_key);
+  nvs_set_str(nvs_handle, NVS_KEY_WG_ENDPOINT, config->wg_endpoint);
+  nvs_set_u16(nvs_handle, NVS_KEY_WG_PORT, config->wg_port);
+  nvs_set_u16(nvs_handle, NVS_KEY_WG_KEEPALIVE, config->wg_keepalive);
+  nvs_set_str(nvs_handle, NVS_KEY_WG_DNS, config->wg_dns);
 
   err = nvs_commit(nvs_handle);
   nvs_close(nvs_handle);
@@ -744,6 +918,32 @@ static esp_err_t load_wifi_config(repeater_config_t *config)
   len = sizeof(config->ap_password);
   nvs_get_str(nvs_handle, NVS_KEY_AP_PASS, config->ap_password, &len);
 
+  // WireGuard settings (absent in configs saved by older firmware)
+  uint8_t wg_enabled = 0;
+  nvs_get_u8(nvs_handle, NVS_KEY_WG_ENABLED, &wg_enabled);
+  config->wg_enabled = (wg_enabled == 1);
+
+  len = sizeof(config->wg_private_key);
+  nvs_get_str(nvs_handle, NVS_KEY_WG_PRIVATE_KEY, config->wg_private_key, &len);
+
+  len = sizeof(config->wg_address);
+  nvs_get_str(nvs_handle, NVS_KEY_WG_ADDRESS, config->wg_address, &len);
+
+  len = sizeof(config->wg_peer_public_key);
+  nvs_get_str(nvs_handle, NVS_KEY_WG_PEER_KEY, config->wg_peer_public_key, &len);
+
+  len = sizeof(config->wg_preshared_key);
+  nvs_get_str(nvs_handle, NVS_KEY_WG_PSK, config->wg_preshared_key, &len);
+
+  len = sizeof(config->wg_endpoint);
+  nvs_get_str(nvs_handle, NVS_KEY_WG_ENDPOINT, config->wg_endpoint, &len);
+
+  nvs_get_u16(nvs_handle, NVS_KEY_WG_PORT, &config->wg_port);
+  nvs_get_u16(nvs_handle, NVS_KEY_WG_KEEPALIVE, &config->wg_keepalive);
+
+  len = sizeof(config->wg_dns);
+  nvs_get_str(nvs_handle, NVS_KEY_WG_DNS, config->wg_dns, &len);
+
   config->configured = true;
   nvs_close(nvs_handle);
 
@@ -777,76 +977,120 @@ static esp_err_t clear_wifi_config(void)
  */
 static esp_err_t root_handler(httpd_req_t *req)
 {
-  // Allocate buffer for HTML page (larger to avoid truncation)
-  char *html_buffer = (char *)malloc(4096);
-  if (!html_buffer)
+  httpd_resp_set_type(req, "text/html");
+  send_config_html(req, &stored_config);
+  return ESP_OK;
+}
+
+/**
+ * Parse "a.b.c.d/prefix" into separate address and netmask strings.
+ * A missing prefix means /32.
+ */
+static bool parse_cidr(const char *cidr, char *ip_out, size_t ip_len, char *mask_out, size_t mask_len)
+{
+  char ip[16];
+  const char *slash = strchr(cidr, '/');
+  size_t addr_len = slash ? (size_t)(slash - cidr) : strlen(cidr);
+  if (addr_len == 0 || addr_len >= sizeof(ip))
+    return false;
+  memcpy(ip, cidr, addr_len);
+  ip[addr_len] = '\0';
+
+  ip4_addr_t addr;
+  if (!ip4addr_aton(ip, &addr))
+    return false;
+
+  int prefix = 32;
+  if (slash)
+  {
+    char *end;
+    prefix = strtol(slash + 1, &end, 10);
+    if (end == slash + 1 || *end != '\0' || prefix < 0 || prefix > 32)
+      return false;
+  }
+
+  uint32_t mask = prefix == 0 ? 0 : 0xFFFFFFFFu << (32 - prefix);
+  snprintf(ip_out, ip_len, "%s", ip);
+  snprintf(mask_out, mask_len, "%u.%u.%u.%u",
+           (unsigned)(mask >> 24) & 0xFF, (unsigned)(mask >> 16) & 0xFF,
+           (unsigned)(mask >> 8) & 0xFF, (unsigned)mask & 0xFF);
+  return true;
+}
+
+/**
+ * Read a urlencoded POST body into buf (NUL terminated)
+ */
+static bool read_post_body(httpd_req_t *req, char *buf, size_t buf_len)
+{
+  if (req->content_len >= buf_len)
+    return false;
+
+  size_t received = 0;
+  while (received < req->content_len)
+  {
+    int ret = httpd_req_recv(req, buf + received, req->content_len - received);
+    if (ret == HTTPD_SOCK_ERR_TIMEOUT)
+      continue;
+    if (ret <= 0)
+      return false;
+    received += ret;
+  }
+  buf[received] = '\0';
+  return true;
+}
+
+/**
+ * Save configuration handler - processes form submission via POST
+ */
+static esp_err_t save_handler(httpd_req_t *req)
+{
+  char *body = (char *)malloc(1536);
+  if (!body)
   {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
     return ESP_FAIL;
   }
 
-  // Generate HTML with current configuration
-  generate_config_html(html_buffer, 4096, &stored_config);
-
-  // Send response
-  httpd_resp_set_type(req, "text/html");
-  httpd_resp_send(req, html_buffer, HTTPD_RESP_USE_STRLEN);
-
-  // Free buffer
-  free(html_buffer);
-  return ESP_OK;
-}
-
-/**
- * Save configuration handler - processes form submission via GET
- */
-static esp_err_t save_handler(httpd_req_t *req)
-{
-  char query[512];
-  size_t query_len = sizeof(query);
-
-  // Get query string from URL
-  if (httpd_req_get_url_query_str(req, query, query_len) != ESP_OK)
+  if (!read_post_body(req, body, 1536))
   {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing query parameters");
+    free(body);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or too large form data");
     return ESP_FAIL;
   }
 
-  ESP_LOGI(TAG_MAIN, "Received config query");
+  ESP_LOGI(TAG_MAIN, "Received config form");
 
-  // Parse query parameters - start with existing config to preserve passwords if left blank
+  // Parse form fields - start with existing config to preserve passwords if left blank
   repeater_config_t new_config = stored_config;
+  const char *error = NULL;
 
-  if (!parse_query_param(query, "sta_ssid", new_config.sta_ssid, sizeof(new_config.sta_ssid)))
+  if (!parse_query_param(body, "sta_ssid", new_config.sta_ssid, sizeof(new_config.sta_ssid)))
   {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing sta_ssid");
-    return ESP_FAIL;
+    error = "Missing sta_ssid";
   }
 
   // Parse password, but only update if not empty
   char temp_pass[64] = {0};
-  if (parse_query_param(query, "sta_pass", temp_pass, sizeof(temp_pass)) && strlen(temp_pass) > 0)
+  if (!error && parse_query_param(body, "sta_pass", temp_pass, sizeof(temp_pass)) && strlen(temp_pass) > 0)
   {
     strncpy(new_config.sta_password, temp_pass, sizeof(new_config.sta_password));
   }
 
-  if (!parse_query_param(query, "ap_ssid", new_config.ap_ssid, sizeof(new_config.ap_ssid)))
+  if (!error && !parse_query_param(body, "ap_ssid", new_config.ap_ssid, sizeof(new_config.ap_ssid)))
   {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing ap_ssid");
-    return ESP_FAIL;
+    error = "Missing ap_ssid";
   }
 
   // Parse AP password, but only update if not empty (unless it was previously empty)
   memset(temp_pass, 0, sizeof(temp_pass));
-  if (parse_query_param(query, "ap_pass", temp_pass, sizeof(temp_pass)))
+  if (!error && parse_query_param(body, "ap_pass", temp_pass, sizeof(temp_pass)))
   {
     // If new password provided, validate it
     if (strlen(temp_pass) > 0)
     {
       if (strlen(temp_pass) < 8)
       {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "AP password must be at least 8 characters or empty");
-        return ESP_FAIL;
+        error = "AP password must be at least 8 characters or empty";
       }
       strncpy(new_config.ap_password, temp_pass, sizeof(new_config.ap_password));
     }
@@ -858,12 +1102,81 @@ static esp_err_t save_handler(httpd_req_t *req)
     // Otherwise keep existing password
   }
 
+  /* WireGuard - checkbox is only present in the form data when checked */
+  char temp[96] = {0};
+  new_config.wg_enabled = parse_query_param(body, "wg_en", temp, sizeof(temp));
+  parse_query_param(body, "wg_addr", new_config.wg_address, sizeof(new_config.wg_address));
+  parse_query_param(body, "wg_peer", new_config.wg_peer_public_key, sizeof(new_config.wg_peer_public_key));
+  parse_query_param(body, "wg_host", new_config.wg_endpoint, sizeof(new_config.wg_endpoint));
+  parse_query_param(body, "wg_dns", new_config.wg_dns, sizeof(new_config.wg_dns));
+
+  memset(temp, 0, sizeof(temp));
+  if (parse_query_param(body, "wg_priv", temp, sizeof(temp)) && strlen(temp) > 0)
+  {
+    strncpy(new_config.wg_private_key, temp, sizeof(new_config.wg_private_key) - 1);
+  }
+
+  memset(temp, 0, sizeof(temp));
+  if (parse_query_param(body, "wg_psk", temp, sizeof(temp)) && strlen(temp) > 0)
+  {
+    if (strcmp(temp, "-") == 0)
+      memset(new_config.wg_preshared_key, 0, sizeof(new_config.wg_preshared_key));
+    else
+      strncpy(new_config.wg_preshared_key, temp, sizeof(new_config.wg_preshared_key) - 1);
+  }
+
+  memset(temp, 0, sizeof(temp));
+  if (parse_query_param(body, "wg_port", temp, sizeof(temp)) && strlen(temp) > 0)
+  {
+    int port = atoi(temp);
+    if (port < 1 || port > 65535)
+      error = "WireGuard port must be 1-65535";
+    new_config.wg_port = (uint16_t)port;
+  }
+
+  memset(temp, 0, sizeof(temp));
+  if (parse_query_param(body, "wg_ka", temp, sizeof(temp)) && strlen(temp) > 0)
+  {
+    int keepalive = atoi(temp);
+    // Keepalive keeps the session alive while the tunnel is not the default route
+    if (keepalive < 1 || keepalive > 65535)
+      error = "WireGuard keepalive must be 1-65535";
+    new_config.wg_keepalive = (uint16_t)keepalive;
+  }
+
+  free(body);
+
+  if (!error && new_config.wg_enabled)
+  {
+    char ip[16], mask[16];
+    ip4_addr_t dns;
+    if (strlen(new_config.wg_private_key) != WG_KEY_B64_LEN)
+      error = "WireGuard private key must be a 44 character base64 key";
+    else if (strlen(new_config.wg_peer_public_key) != WG_KEY_B64_LEN)
+      error = "WireGuard peer public key must be a 44 character base64 key";
+    else if (strlen(new_config.wg_preshared_key) != 0 && strlen(new_config.wg_preshared_key) != WG_KEY_B64_LEN)
+      error = "WireGuard preshared key must be a 44 character base64 key";
+    else if (!parse_cidr(new_config.wg_address, ip, sizeof(ip), mask, sizeof(mask)))
+      error = "WireGuard address must look like 10.6.0.2/32";
+    else if (strlen(new_config.wg_endpoint) == 0)
+      error = "WireGuard endpoint is required";
+    else if (strlen(new_config.wg_dns) > 0 && !ip4addr_aton(new_config.wg_dns, &dns))
+      error = "DNS must be an IPv4 address";
+  }
+
+  if (error)
+  {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, error);
+    return ESP_FAIL;
+  }
+
   new_config.configured = true;
 
   ESP_LOGI(TAG_MAIN, "New configuration:");
   ESP_LOGI(TAG_MAIN, "  Uplink SSID: %s", new_config.sta_ssid);
   ESP_LOGI(TAG_MAIN, "  AP SSID: %s", new_config.ap_ssid);
   ESP_LOGI(TAG_MAIN, "  AP Password: %s", strlen(new_config.ap_password) > 0 ? "***" : "(open)");
+  ESP_LOGI(TAG_MAIN, "  WireGuard: %s", new_config.wg_enabled ? new_config.wg_endpoint : "disabled");
 
   // Save configuration
   esp_err_t err = save_wifi_config(&new_config);
@@ -886,6 +1199,117 @@ static esp_err_t save_handler(httpd_req_t *req)
 }
 
 /**
+ * Send a JSON string literal (with quotes), escaping special characters
+ */
+static void send_json_string(httpd_req_t *req, const char *src)
+{
+  char buf[80];
+  size_t pos = 0;
+  buf[pos++] = '"';
+  while (*src)
+  {
+    unsigned char c = (unsigned char)*src++;
+    if (pos + 7 >= sizeof(buf))
+    {
+      httpd_resp_send_chunk(req, buf, pos);
+      pos = 0;
+    }
+    if (c == '"' || c == '\\')
+    {
+      buf[pos++] = '\\';
+      buf[pos++] = c;
+    }
+    else if (c < 0x20)
+    {
+      pos += snprintf(buf + pos, sizeof(buf) - pos, "\\u%04x", c);
+    }
+    else
+    {
+      buf[pos++] = c;
+    }
+  }
+  buf[pos++] = '"';
+  httpd_resp_send_chunk(req, buf, pos);
+}
+
+#define WIFI_SCAN_MAX_APS 20
+
+/**
+ * WiFi scan handler - returns nearby networks as JSON
+ */
+static esp_err_t scan_handler(httpd_req_t *req)
+{
+  wifi_scan_config_t scan_config = {};
+  scan_config.show_hidden = false;
+
+  ESP_LOGI(TAG_STA, "Scanning for networks...");
+  esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+  if (err != ESP_OK)
+  {
+    // e.g. ESP_ERR_WIFI_STATE while the station is busy connecting
+    ESP_LOGW(TAG_STA, "Scan failed: %s", esp_err_to_name(err));
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_sendstr(req, esp_err_to_name(err));
+    return ESP_OK;
+  }
+
+  uint16_t count = WIFI_SCAN_MAX_APS;
+  wifi_ap_record_t *records = (wifi_ap_record_t *)calloc(WIFI_SCAN_MAX_APS, sizeof(wifi_ap_record_t));
+  if (!records)
+  {
+    esp_wifi_clear_ap_list();
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
+    return ESP_FAIL;
+  }
+  esp_wifi_scan_get_ap_records(&count, records);
+  ESP_LOGI(TAG_STA, "Scan found %d networks", count);
+
+  // Records are sorted by RSSI; list each SSID once (strongest AP)
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr_chunk(req, "[");
+  bool first = true;
+  for (int i = 0; i < count; i++)
+  {
+    const char *ssid = (const char *)records[i].ssid;
+    if (ssid[0] == '\0')
+      continue;
+
+    bool duplicate = false;
+    for (int j = 0; j < i && !duplicate; j++)
+      duplicate = strcmp(ssid, (const char *)records[j].ssid) == 0;
+    if (duplicate)
+      continue;
+
+    char fields[64];
+    httpd_resp_sendstr_chunk(req, first ? "{\"ssid\":" : ",{\"ssid\":");
+    send_json_string(req, ssid);
+    snprintf(fields, sizeof(fields), ",\"rssi\":%d,\"ch\":%d,\"auth\":%s}",
+             records[i].rssi, records[i].primary,
+             records[i].authmode == WIFI_AUTH_OPEN ? "false" : "true");
+    httpd_resp_sendstr_chunk(req, fields);
+    first = false;
+  }
+  httpd_resp_sendstr_chunk(req, "]");
+  httpd_resp_sendstr_chunk(req, NULL);
+
+  free(records);
+  return ESP_OK;
+}
+
+/**
+ * Catch-all handler - redirects to the config page.
+ * Together with the DNS server in setup mode this makes phones and laptops
+ * open the configuration page automatically (captive portal).
+ */
+static esp_err_t captive_redirect_handler(httpd_req_t *req)
+{
+  httpd_resp_set_status(req, "302 Found");
+  httpd_resp_set_hdr(req, "Location", "http://" WEB_CONFIG_IP "/");
+  httpd_resp_send(req, NULL, 0);
+  return ESP_OK;
+}
+
+/**
  * Start web server
  */
 static httpd_handle_t start_webserver(void)
@@ -893,6 +1317,7 @@ static httpd_handle_t start_webserver(void)
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.stack_size = WEB_SERVER_STACK_SIZE;
   config.uri_match_fn = httpd_uri_match_wildcard;
+  config.lru_purge_enable = true; // OS captive portal probes open many connections
 
   ESP_LOGI(TAG_MAIN, "Starting web server on port %d", config.server_port);
 
@@ -908,10 +1333,25 @@ static httpd_handle_t start_webserver(void)
 
     httpd_uri_t save = {
         .uri = "/save",
-        .method = HTTP_GET,
+        .method = HTTP_POST,
         .handler = save_handler,
         .user_ctx = NULL};
     httpd_register_uri_handler(web_server, &save);
+
+    httpd_uri_t scan = {
+        .uri = "/scan",
+        .method = HTTP_GET,
+        .handler = scan_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(web_server, &scan);
+
+    // Must be registered last - matches everything
+    httpd_uri_t captive = {
+        .uri = "/*",
+        .method = HTTP_GET,
+        .handler = captive_redirect_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(web_server, &captive);
 
     ESP_LOGI(TAG_MAIN, "✓ Web server started successfully");
     ESP_LOGI(TAG_MAIN, "  Access at: http://192.168.4.1/");
@@ -921,6 +1361,76 @@ static httpd_handle_t start_webserver(void)
 
   ESP_LOGE(TAG_MAIN, "✗ Failed to start web server");
   return NULL;
+}
+
+/**
+ * Captive portal DNS server (setup mode only).
+ * Answers every A query with the AP address so any hostname leads to the config page.
+ */
+static void captive_dns_task(void *pvParameters)
+{
+  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock < 0)
+  {
+    ESP_LOGE(TAG_MAIN, "DNS: failed to create socket");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  struct sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(53);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+  {
+    ESP_LOGE(TAG_MAIN, "DNS: failed to bind port 53");
+    close(sock);
+    vTaskDelete(NULL);
+    return;
+  }
+
+  esp_netif_ip_info_t ip_info;
+  esp_netif_get_ip_info(ap_netif, &ip_info);
+  ESP_LOGI(TAG_MAIN, "✓ Captive portal DNS started (all names -> " IPSTR ")", IP2STR(&ip_info.ip));
+
+  uint8_t buf[512];
+  while (1)
+  {
+    struct sockaddr_in client;
+    socklen_t client_len = sizeof(client);
+    // Leave room for the 16 byte answer record
+    int len = recvfrom(sock, buf, sizeof(buf) - 16, 0, (struct sockaddr *)&client, &client_len);
+
+    // Only standard queries (QR=0, OPCODE=0) with exactly one question
+    if (len < 12 || (buf[2] & 0x80) || (buf[2] & 0x78) || buf[4] != 0 || buf[5] != 1)
+      continue;
+
+    // Skip QNAME labels
+    int pos = 12;
+    while (pos < len && buf[pos] != 0)
+      pos += buf[pos] + 1;
+    if (pos + 5 > len)
+      continue;
+    uint16_t qtype = (buf[pos + 1] << 8) | buf[pos + 2];
+    int resp_len = pos + 5; // drop any additional records (EDNS)
+
+    bool answer = (qtype == 1 /* A */ || qtype == 255 /* ANY */);
+    buf[2] = 0x84 | (buf[2] & 0x01); // QR, AA, keep RD
+    buf[3] = 0x80;                   // RA, NOERROR
+    buf[6] = 0;
+    buf[7] = answer ? 1 : 0; // ANCOUNT
+    memset(&buf[8], 0, 4);   // NSCOUNT, ARCOUNT
+
+    if (answer)
+    {
+      const uint8_t record[12] = {0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04};
+      memcpy(&buf[resp_len], record, sizeof(record));
+      memcpy(&buf[resp_len + 12], &ip_info.ip.addr, 4);
+      resp_len += 16;
+    }
+
+    sendto(sock, buf, resp_len, 0, (struct sockaddr *)&client, client_len);
+  }
 }
 
 /**
@@ -1032,19 +1542,31 @@ static void display_update_status(void)
     }
 
     // Internet status indicator (circle) - Green when internet is actually working
-    if (internet_connected)
+    if (uplink_state == UPLINK_ONLINE)
     {
       lcd_draw_string(200, uplink_y + 3, "NET", TERM_GREEN_DIM, TERM_BG);
       draw_circle(228, uplink_y + 7, 5, TERM_GREEN); // Bright green = Internet confirmed
     }
-    else if (sta_connected)
+    else if (uplink_state == UPLINK_PORTAL)
+    {
+      lcd_draw_string(160, uplink_y + 3, "LOGIN", TERM_ACCENT, TERM_BG);
+      draw_circle(228, uplink_y + 7, 5, RGB565(0, 165, 255)); // Orange = Captive portal, login required
+    }
+    else if (uplink_state == UPLINK_CHECKING)
     {
       lcd_draw_string(203, uplink_y + 3, "...", TERM_GREEN_DIM, TERM_BG);
       draw_circle(228, uplink_y + 7, 5, RGB565(0, 200, 200)); // Yellow = Connected, checking...
     }
     else
     {
-      draw_circle(228, uplink_y + 7, 5, RGB565(0, 0, 200)); // Red = Disconnected
+      draw_circle(228, uplink_y + 7, 5, RGB565(0, 0, 200)); // Red = No internet
+    }
+
+    // WireGuard tunnel status
+    if (stored_config.wg_enabled)
+    {
+      const char *vpn_str = wg_is_default ? "VPN:ON" : (wg_peer_up ? "VPN:RDY" : "VPN:..");
+      lcd_draw_string(176, uplink_y + 27, vpn_str, wg_is_default ? TERM_GREEN : TERM_GREEN_DIM, TERM_BG);
     }
   }
   else
@@ -1112,7 +1634,28 @@ static void display_update_status(void)
 }
 
 /**
+ * Set the DNS server offered to AP clients by the DHCP server
+ */
+static void set_ap_dhcp_dns(const esp_netif_dns_info_t *dns)
+{
+  // Stop DHCP server
+  esp_netif_dhcps_stop(ap_netif);
+
+  // Enable DNS option
+  uint8_t dhcps_offer_option = DHCPS_OFFER_DNS;
+  esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+                         &dhcps_offer_option, sizeof(dhcps_offer_option));
+
+  // Set DNS info
+  esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, (esp_netif_dns_info_t *)dns);
+
+  // Restart DHCP server
+  esp_netif_dhcps_start(ap_netif);
+}
+
+/**
  * Forward DNS settings from STA interface to AP's DHCP server
+ * (or offer the configured VPN DNS when WireGuard is enabled)
  */
 static void setup_dns_forwarding(void)
 {
@@ -1122,27 +1665,22 @@ static void setup_dns_forwarding(void)
     return;
   }
 
-  esp_netif_dns_info_t dns;
+  esp_netif_dns_info_t dns = {};
+  if (stored_config.wg_enabled && strlen(stored_config.wg_dns) > 0)
+  {
+    dns.ip.type = ESP_IPADDR_TYPE_V4;
+    dns.ip.u_addr.ip4.addr = ipaddr_addr(stored_config.wg_dns);
+    ESP_LOGI(TAG_MAIN, "Offering VPN DNS: " IPSTR, IP2STR(&dns.ip.u_addr.ip4));
+    set_ap_dhcp_dns(&dns);
+    return;
+  }
+
   esp_err_t err = esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns);
 
   if (err == ESP_OK)
   {
     ESP_LOGI(TAG_MAIN, "Forwarding DNS: " IPSTR, IP2STR(&dns.ip.u_addr.ip4));
-
-    // Stop DHCP server
-    esp_netif_dhcps_stop(ap_netif);
-
-    // Enable DNS option
-    uint8_t dhcps_offer_option = DHCPS_OFFER_DNS;
-    esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
-                           &dhcps_offer_option, sizeof(dhcps_offer_option));
-
-    // Set DNS info
-    esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns);
-
-    // Restart DHCP server
-    esp_netif_dhcps_start(ap_netif);
-
+    set_ap_dhcp_dns(&dns);
     ESP_LOGI(TAG_MAIN, "DNS forwarding configured successfully");
   }
   else
@@ -1152,56 +1690,221 @@ static void setup_dns_forwarding(void)
 }
 
 /**
- * Check internet connectivity by pinging Google DNS
+ * HTTP client event handler for the connectivity probe - remembers the
+ * redirect target, which is the captive portal login page
+ */
+static esp_err_t probe_http_event_handler(esp_http_client_event_t *evt)
+{
+  if (evt->event_id == HTTP_EVENT_ON_HEADER && strcasecmp(evt->header_key, "Location") == 0)
+  {
+    strlcpy((char *)evt->user_data, evt->header_value, sizeof(portal_url));
+  }
+  return ESP_OK;
+}
+
+/**
+ * Check internet connectivity and detect captive portals.
+ *
+ * Requests a URL that returns an empty HTTP 204 on a free internet
+ * connection. A redirect or any other answer means a captive portal
+ * intercepts traffic. The request is bound to the uplink interface so
+ * the result is independent of the WireGuard tunnel.
  */
 static void check_internet_connectivity(void)
 {
   if (!sta_connected)
   {
-    internet_connected = false;
+    uplink_state = UPLINK_OFFLINE;
     return;
   }
 
   ESP_LOGI(TAG_MAIN, "Checking internet connectivity...");
 
-  esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
-  ping_config.count = 1;
-  ping_config.interval_ms = 1000;
-  ping_config.timeout_ms = 3000;
-  ping_config.target_addr.u_addr.ip4.addr = ipaddr_addr("8.8.8.8"); // Google DNS
-  ping_config.target_addr.type = IPADDR_TYPE_V4;
+  struct ifreq ifr = {};
+  esp_netif_get_netif_impl_name(sta_netif, ifr.ifr_name);
 
-  esp_ping_callbacks_t cbs = {0};
-  esp_ping_handle_t ping_handle = NULL;
+  char location[sizeof(portal_url)] = {0};
+  esp_http_client_config_t config = {};
+  config.url = CONNECTIVITY_CHECK_URL;
+  config.timeout_ms = 5000;
+  config.disable_auto_redirect = true;
+  config.event_handler = probe_http_event_handler;
+  config.user_data = location;
+  config.if_name = &ifr;
 
-  esp_err_t ret = esp_ping_new_session(&ping_config, &cbs, &ping_handle);
-  if (ret == ESP_OK)
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (!client)
   {
-    esp_ping_start(ping_handle);
-    vTaskDelay(pdMS_TO_TICKS(3500)); // Wait for ping to complete
-    esp_ping_stop(ping_handle);
+    ESP_LOGE(TAG_MAIN, "Failed to create HTTP client");
+    uplink_state = UPLINK_OFFLINE;
+    return;
+  }
 
-    uint32_t transmitted, received;
-    esp_ping_get_profile(ping_handle, ESP_PING_PROF_REQUEST, &transmitted, sizeof(transmitted));
-    esp_ping_get_profile(ping_handle, ESP_PING_PROF_REPLY, &received, sizeof(received));
+  esp_err_t err = esp_http_client_perform(client);
+  int status = esp_http_client_get_status_code(client);
+  esp_http_client_cleanup(client);
 
-    if (received > 0)
-    {
-      ESP_LOGI(TAG_MAIN, "✓ Internet connectivity confirmed (ping successful)");
-      internet_connected = true;
-    }
-    else
-    {
-      ESP_LOGW(TAG_MAIN, "✗ No internet connectivity (ping failed)");
-      internet_connected = false;
-    }
-
-    esp_ping_delete_session(ping_handle);
+  if (err != ESP_OK)
+  {
+    ESP_LOGW(TAG_MAIN, "✗ No internet connectivity (%s)", esp_err_to_name(err));
+    uplink_state = UPLINK_OFFLINE;
+  }
+  else if (status == 204)
+  {
+    ESP_LOGI(TAG_MAIN, "✓ Internet connectivity confirmed");
+    uplink_state = UPLINK_ONLINE;
+    portal_url[0] = '\0';
   }
   else
   {
-    ESP_LOGE(TAG_MAIN, "Failed to create ping session");
-    internet_connected = false;
+    strlcpy(portal_url, location, sizeof(portal_url));
+    ESP_LOGW(TAG_MAIN, "⚠ Captive portal detected (HTTP %d) - login at: %s",
+             status, strlen(portal_url) > 0 ? portal_url : PORTAL_FALLBACK_URL);
+    uplink_state = UPLINK_PORTAL;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * WIREGUARD VPN
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* lwIP is not thread safe - these run inside the TCP/IP task */
+static esp_err_t wg_init_cb(void *ctx) { return esp_wireguard_init(&wg_config, (wireguard_ctx_t *)ctx); }
+static esp_err_t wg_connect_cb(void *ctx) { return esp_wireguard_connect((wireguard_ctx_t *)ctx); }
+static esp_err_t wg_disconnect_cb(void *ctx) { return esp_wireguard_disconnect((wireguard_ctx_t *)ctx); }
+static esp_err_t wg_peer_is_up_cb(void *ctx) { return esp_wireguard_peer_is_up((wireguard_ctx_t *)ctx); }
+static esp_err_t wg_set_default_cb(void *ctx) { return esp_wireguard_set_default((wireguard_ctx_t *)ctx); }
+static esp_err_t wg_restore_default_cb(void *ctx) { return esp_wireguard_restore_default((wireguard_ctx_t *)ctx); }
+static esp_err_t wg_allow_all_cb(void *ctx)
+{
+  // Full tunnel: accept and route any address through the peer
+  return esp_wireguard_add_allowed_ip((wireguard_ctx_t *)ctx, "0.0.0.0", "0.0.0.0");
+}
+
+/**
+ * Synchronize the clock via SNTP. WireGuard handshakes carry a timestamp
+ * and peers reject handshakes older than the last one they have seen, so
+ * a clock starting at 1970 after every reboot would not work.
+ */
+static bool wg_sync_time(void)
+{
+  static bool sntp_started = false;
+  if (!sntp_started)
+  {
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_netif_sntp_init(&config);
+    sntp_started = true;
+  }
+
+  time_t now = time(NULL);
+  if (now < 1700000000)
+  {
+    esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
+    now = time(NULL);
+  }
+  if (now < 1700000000)
+  {
+    ESP_LOGW(TAG_MAIN, "WireGuard: waiting for time sync");
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Start the tunnel and route client traffic through it.
+ *
+ * The tunnel becomes the default route only while the uplink has real
+ * internet access - during captive portal login clients must reach the
+ * portal directly. Called periodically from the status task.
+ */
+static void wireguard_update(void)
+{
+  if (!stored_config.wg_enabled || !sta_connected)
+    return;
+
+  if (!wg_connected)
+  {
+    // Wait until a captive portal (if any) has been passed
+    if (uplink_state != UPLINK_ONLINE || !wg_sync_time())
+      return;
+
+    if (!wg_initialized)
+    {
+      if (!parse_cidr(stored_config.wg_address, wg_ip, sizeof(wg_ip), wg_netmask, sizeof(wg_netmask)))
+      {
+        ESP_LOGE(TAG_MAIN, "WireGuard: invalid address %s", stored_config.wg_address);
+        return;
+      }
+      memset(&wg_config, 0, sizeof(wg_config));
+      wg_config.private_key = stored_config.wg_private_key;
+      wg_config.public_key = stored_config.wg_peer_public_key;
+      wg_config.preshared_key = strlen(stored_config.wg_preshared_key) > 0 ? stored_config.wg_preshared_key : NULL;
+      wg_config.address = wg_ip;
+      wg_config.netmask = wg_netmask;
+      wg_config.endpoint = stored_config.wg_endpoint;
+      wg_config.port = stored_config.wg_port;
+      wg_config.persistent_keepalive = stored_config.wg_keepalive;
+
+      esp_err_t err = esp_netif_tcpip_exec(wg_init_cb, &wg_ctx);
+      if (err != ESP_OK)
+      {
+        ESP_LOGE(TAG_MAIN, "WireGuard: init failed: %s", esp_err_to_name(err));
+        return;
+      }
+      wg_initialized = true;
+    }
+
+    // Endpoint hostname is resolved asynchronously - retry a few times
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 5; attempt++)
+    {
+      err = esp_netif_tcpip_exec(wg_connect_cb, &wg_ctx);
+      if (err != ESP_ERR_RETRY)
+        break;
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    if (err == ESP_OK)
+    {
+      err = esp_netif_tcpip_exec(wg_allow_all_cb, &wg_ctx);
+      if (err != ESP_OK)
+      {
+        ESP_LOGE(TAG_MAIN, "WireGuard: failed to allow 0.0.0.0/0: %s", esp_err_to_name(err));
+      }
+      wg_connected = true;
+      ESP_LOGI(TAG_MAIN, "WireGuard: connecting to %s:%d", stored_config.wg_endpoint, stored_config.wg_port);
+    }
+    else if (err != ESP_ERR_RETRY)
+    {
+      ESP_LOGE(TAG_MAIN, "WireGuard: connect failed: %s", esp_err_to_name(err));
+      // Reset the interface so the next attempt starts clean
+      if (wg_ctx.netif)
+        esp_netif_tcpip_exec(wg_disconnect_cb, &wg_ctx);
+    }
+    return;
+  }
+
+  wg_peer_up = esp_netif_tcpip_exec(wg_peer_is_up_cb, &wg_ctx) == ESP_OK;
+
+  // esp_netif may switch the default route back to STA (e.g. after a reconnect),
+  // so compare with the actual lwIP default instead of a remembered flag
+  wg_is_default = wg_ctx.netif != NULL && netif_default == wg_ctx.netif;
+
+  bool want_default = wg_peer_up && uplink_state == UPLINK_ONLINE;
+  if (want_default && !wg_is_default)
+  {
+    if (esp_netif_tcpip_exec(wg_set_default_cb, &wg_ctx) == ESP_OK)
+    {
+      wg_is_default = true;
+      ESP_LOGI(TAG_MAIN, "✓ WireGuard tunnel up - routing client traffic through VPN");
+    }
+  }
+  else if (!want_default && wg_is_default)
+  {
+    esp_netif_tcpip_exec(wg_restore_default_cb, &wg_ctx);
+    wg_is_default = false;
+    ESP_LOGW(TAG_MAIN, "WireGuard: %s - routing directly via uplink",
+             wg_peer_up ? "uplink needs login" : "peer down");
   }
 }
 
@@ -1264,8 +1967,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
   /* Station Events */
   else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
   {
-    ESP_LOGI(TAG_STA, "Station started, connecting to AP...");
-    esp_wifi_connect();
+    // In setup mode the station only exists for WiFi scanning
+    if (!config_mode)
+    {
+      ESP_LOGI(TAG_STA, "Station started, connecting to AP...");
+      esp_wifi_connect();
+    }
   }
   else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
   {
@@ -1281,6 +1988,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
       ESP_LOGE(TAG_STA, "Failed to connect to AP after %d attempts", WIFI_STA_MAXIMUM_RETRY);
     }
     sta_connected = false;
+    uplink_state = UPLINK_OFFLINE;
     display_update_status();
   }
   else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
@@ -1298,8 +2006,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
       enable_napt();
     }
 
-    /* Check internet connectivity */
-    check_internet_connectivity();
+    /* Check internet connectivity / captive portal in the status task */
+    uplink_state = UPLINK_CHECKING;
+    if (status_task_handle)
+    {
+      xTaskNotifyGive(status_task_handle);
+    }
 
     display_update_status();
   }
@@ -1363,7 +2075,7 @@ static void wifi_init_sta(void)
 }
 
 /**
- * Status monitoring task
+ * Status monitoring task - connectivity / captive portal checks and WireGuard
  */
 static void status_task(void *pvParameters)
 {
@@ -1373,6 +2085,7 @@ static void status_task(void *pvParameters)
     {
       // Check internet connectivity periodically
       check_internet_connectivity();
+      wireguard_update();
 
       wifi_ap_record_t ap_info;
       if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
@@ -1382,21 +2095,28 @@ static void status_task(void *pvParameters)
                  stored_config.sta_ssid, ap_info.rssi);
         ESP_LOGI(TAG_MAIN, "AP Clients: %d", ap_client_count);
         ESP_LOGI(TAG_MAIN, "NAT: %s", napt_enabled ? "✓ ACTIVE" : "✗ DISABLED");
-        ESP_LOGI(TAG_MAIN, "Internet: %s", internet_connected ? "✓ ONLINE" : "✗ OFFLINE");
+        ESP_LOGI(TAG_MAIN, "Internet: %s",
+                 uplink_state == UPLINK_ONLINE ? "✓ ONLINE" : (uplink_state == UPLINK_PORTAL ? "⚠ CAPTIVE PORTAL" : "✗ OFFLINE"));
+        if (stored_config.wg_enabled)
+        {
+          ESP_LOGI(TAG_MAIN, "WireGuard: %s",
+                   wg_is_default ? "✓ ROUTING" : (wg_peer_up ? "⧗ PEER UP" : "⧗ CONNECTING"));
+        }
         ESP_LOGI(TAG_MAIN, "Repeater: %s",
-                 (sta_connected && internet_connected) ? "✓ READY" : "⧗ INITIALIZING");
+                 (sta_connected && uplink_state == UPLINK_ONLINE) ? "✓ READY" : "⧗ INITIALIZING");
       }
     }
     else
     {
-      internet_connected = false;
+      uplink_state = UPLINK_OFFLINE;
       ESP_LOGI(TAG_MAIN, "Waiting for uplink connection...");
     }
 
     // Update display
     display_update_status();
 
-    vTaskDelay(pdMS_TO_TICKS(10000)); // Update every 10 seconds
+    // Update every 10 seconds, or right away when the uplink gets an IP
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000));
   }
 }
 
@@ -1424,6 +2144,8 @@ extern "C" void app_main(void)
   ESP_ERROR_CHECK(ret);
 
   /* Load configuration */
+  stored_config.wg_port = WG_DEFAULT_PORT;
+  stored_config.wg_keepalive = WG_DEFAULT_KEEPALIVE;
   ret = load_wifi_config(&stored_config);
   if (ret != ESP_OK)
   {
@@ -1439,6 +2161,8 @@ extern "C" void app_main(void)
     // Set temporary AP-only configuration
     strncpy(stored_config.ap_ssid, DEFAULT_CONFIG_AP_SSID, sizeof(stored_config.ap_ssid));
     strncpy(stored_config.ap_password, DEFAULT_CONFIG_AP_PASSWORD, sizeof(stored_config.ap_password));
+    stored_config.wg_port = WG_DEFAULT_PORT;
+    stored_config.wg_keepalive = WG_DEFAULT_KEEPALIVE;
     stored_config.configured = false;
     config_mode = true;
 
@@ -1467,6 +2191,8 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG_MAIN, "  AP SSID: %s", stored_config.ap_ssid);
     ESP_LOGI(TAG_MAIN, "  AP Security: %s",
              strlen(stored_config.ap_password) > 0 ? "WPA2" : "Open");
+    ESP_LOGI(TAG_MAIN, "  WireGuard: %s",
+             stored_config.wg_enabled ? stored_config.wg_endpoint : "disabled");
     config_mode = false;
   }
 
@@ -1495,11 +2221,21 @@ extern "C" void app_main(void)
 
   if (config_mode)
   {
-    /* Config mode: AP only for configuration */
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    /* Config mode: AP for configuration, idle STA for WiFi scanning */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     wifi_init_softap();
+    sta_netif = esp_netif_create_default_wifi_sta();
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG_MAIN, "✓ WiFi started in AP-only mode (config mode)");
+    ESP_LOGI(TAG_MAIN, "✓ WiFi started in AP mode (config mode)");
+
+    /* Captive portal: clients get our IP as DNS, every name resolves to us */
+    esp_netif_ip_info_t ap_ip;
+    esp_netif_get_ip_info(ap_netif, &ap_ip);
+    esp_netif_dns_info_t ap_dns = {};
+    ap_dns.ip.type = ESP_IPADDR_TYPE_V4;
+    ap_dns.ip.u_addr.ip4 = ap_ip.ip;
+    set_ap_dhcp_dns(&ap_dns);
+    xTaskCreate(captive_dns_task, "captive_dns", 4096, NULL, 5, NULL);
 
     /* Start web server for configuration */
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1532,12 +2268,17 @@ extern "C" void app_main(void)
     wifi_init_softap();
     wifi_init_sta();
 
+    /* Create status monitoring task before WiFi starts so it gets notified on connect */
+    xTaskCreate(status_task, "status_task", 8192, NULL, 5, &status_task_handle);
+
     /* Start WiFi */
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_LOGI(TAG_MAIN, "✓ WiFi started in AP+STA mode");
 
-    /* Update display with initial status */
+    /* Start web server right away - also reachable when the uplink fails,
+     * so the uplink can be fixed via WiFi scan */
     vTaskDelay(pdMS_TO_TICKS(1000));
+    start_webserver();
     display_update_status();
 
     /* Wait for connection */
@@ -1551,18 +2292,12 @@ extern "C" void app_main(void)
     /* Check connection result */
     if (bits & WIFI_CONNECTED_BIT)
     {
-      /* Start web server for easy reconfiguration */
-      start_webserver();
-
       ESP_LOGI(TAG_MAIN, "╔═══════════════════════════════════════╗");
       ESP_LOGI(TAG_MAIN, "║  ✓ CardRepeater Ready!               ║");
       ESP_LOGI(TAG_MAIN, "║  Connect to: %-24s║", stored_config.ap_ssid);
       ESP_LOGI(TAG_MAIN, "║  Config IP: %-26s║", WEB_CONFIG_IP);
       ESP_LOGI(TAG_MAIN, "║  NAT Status: %-24s║", napt_enabled ? "ENABLED" : "PENDING");
       ESP_LOGI(TAG_MAIN, "╚═══════════════════════════════════════╝");
-
-      /* Create status monitoring task */
-      xTaskCreate(status_task, "status_task", 4096, NULL, 5, NULL);
     }
     else if (bits & WIFI_FAIL_BIT)
     {
