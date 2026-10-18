@@ -20,6 +20,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -36,9 +37,16 @@
 #include "dhcpserver/dhcpserver.h"
 #include "esp_netif_sntp.h"
 #include "esp_http_client.h"
+#include "esp_timer.h"
+#include "mbedtls/base64.h"
 
 // WireGuard
 #include "esp_wireguard.h"
+
+// Battery (ADC) includes
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 
 // Display includes
 #include "driver/spi_master.h"
@@ -51,7 +59,9 @@
 #include "esp_http_server.h"
 
 /* WiFi Configuration - Dynamic (loaded from NVS) */
-#define WIFI_STA_MAXIMUM_RETRY 10
+#define WIFI_STA_DRIVER_RETRIES 10  // retries within one connection attempt
+#define WIFI_RECONNECT_MIN_MS 1000   // first reconnect delay after losing the uplink
+#define WIFI_RECONNECT_MAX_MS 60000  // the delay doubles up to this
 #define WIFI_AP_CHANNEL 1
 #define WIFI_AP_MAX_CONNECTIONS 10
 
@@ -79,11 +89,17 @@
 #define NVS_KEY_WG_PORT "wg_port"
 #define NVS_KEY_WG_KEEPALIVE "wg_ka"
 #define NVS_KEY_WG_DNS "wg_dns"
+#define NVS_KEY_ADMIN_PASS "admin_pass"
+#define NVS_KEY_DISPLAY_TIMEOUT "disp_off"
 
 /* WireGuard defaults */
 #define WG_DEFAULT_PORT 51820
 #define WG_DEFAULT_KEEPALIVE 25
 #define WG_KEY_B64_LEN 44 // base64 of a 32 byte key
+
+/* Device defaults */
+#define DEFAULT_DISPLAY_TIMEOUT 60 // seconds until the screen turns off, 0 = always on
+#define ADMIN_PASSWORD_MIN_LEN 8
 
 /* Configuration storage */
 typedef struct
@@ -104,13 +120,16 @@ typedef struct
   uint16_t wg_port;
   uint16_t wg_keepalive;
   char wg_dns[16]; // DNS offered to AP clients when VPN is enabled (empty = upstream)
+
+  /* Device */
+  char admin_password[64];  // web panel login (empty only in configs from older firmware)
+  uint16_t display_timeout; // seconds until the screen turns off, 0 = always on
 } repeater_config_t;
 
 static repeater_config_t stored_config = {0};
 
 /* FreeRTOS event group to signal when we are connected */
 #define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT BIT1
 
 /* DHCP server option */
 #define DHCPS_OFFER_DNS 0x02
@@ -121,11 +140,18 @@ static const char *TAG_STA = "WiFi STA";
 static const char *TAG_MAIN = "WiFi Repeater";
 
 static EventGroupHandle_t s_wifi_event_group;
-static int s_retry_num = 0;
+
+/* Uplink reconnects with exponential backoff (never gives up) */
+static esp_timer_handle_t reconnect_timer = NULL;
+static uint32_t reconnect_delay_ms = WIFI_RECONNECT_MIN_MS;
+static volatile bool scan_in_progress = false;
 
 /* Network interface handles */
 static esp_netif_t *sta_netif = NULL;
 static esp_netif_t *ap_netif = NULL;
+
+/* AP address - moves to another subnet when the uplink network uses the same one */
+static char ap_ip_str[16] = WEB_CONFIG_IP;
 
 /* Uplink connectivity state (result of the captive portal probe) */
 typedef enum
@@ -171,6 +197,12 @@ static TaskHandle_t status_task_handle = NULL;
 #define LCD_V_RES 240
 #define LCD_PIXEL_CLK 40000000
 
+/* M5Stack Cardputer G0 button and battery */
+#define BUTTON_G0_PIN 0            // active low; also a strapping pin (download mode at reset)
+#define BATTERY_ADC_PIN 10         // battery voltage through a 1:2 divider
+#define BATTERY_DIVIDER 2
+#define FACTORY_RESET_HOLD_MS 5000 // hold G0 this long to erase all settings
+
 /* Web Server Configuration */
 #define WEB_SERVER_STACK_SIZE 8192
 
@@ -178,6 +210,15 @@ static TaskHandle_t status_task_handle = NULL;
 static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
 static esp_lcd_panel_handle_t lcd_panel_handle = NULL;
 static int ap_client_count = 0;
+
+/* Display power and locking - the screen is drawn from several tasks */
+static SemaphoreHandle_t display_mutex = NULL; // recursive, guards framebuffer and backlight
+static volatile bool display_on = true;
+static volatile bool reset_screen_shown = false; // factory reset countdown owns the screen
+static volatile TickType_t last_activity_tick = 0;
+
+/* Battery voltage in mV (smoothed), -1 = unknown */
+static int battery_mv = -1;
 
 /* Web server handle */
 static httpd_handle_t web_server = NULL;
@@ -453,6 +494,9 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
 
   httpd_resp_sendstr_chunk(req, html_page_head);
   send_status_html(req);
+  if (!config_mode && strlen(config->admin_password) == 0)
+    httpd_resp_sendstr_chunk(req, "<div class='status err'>The web panel has no password yet - anyone on this "
+                                  "network can change these settings. Set one under Device.</div>");
 
   httpd_resp_sendstr_chunk(req,
                            "<form action='/save' method='POST'>"
@@ -531,6 +575,23 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "<div class='info'>The tunnel uses AllowedIPs 0.0.0.0/0. Traffic switches to the VPN "
                            "after a successful handshake and while the uplink has internet access "
                            "(not during captive portal login).</div>"
+                           "</div>"
+                           "<div class='section'>"
+                           "<h2 style='color:#4CAF50;margin-top:0'>Device</h2>"
+                           "<label>Admin Password (web panel login):</label>"
+                           "<input type='password' name='admin_pass' maxlength='63' placeholder='");
+  if (strlen(config->admin_password) > 0)
+    httpd_resp_sendstr_chunk(req, "Leave blank to keep current'>");
+  else
+    httpd_resp_sendstr_chunk(req, "At least 8 characters' minlength='8' required>");
+  httpd_resp_sendstr_chunk(req,
+                           "<label>Screen Timeout (seconds, 0 = always on):</label>"
+                           "<input type='number' name='disp_off' min='0' max='65535' value='");
+  snprintf(num, sizeof(num), "%u", config->display_timeout);
+  httpd_resp_sendstr_chunk(req, num);
+  httpd_resp_sendstr_chunk(req,
+                           "'><div class='info'>Log in with any user name and the admin password. "
+                           "Press G0 to wake the screen; hold G0 for 5 seconds to erase all settings.</div>"
                            "</div>"
                            "<button type='submit'>Save & Restart</button>"
                            "</form>"
@@ -656,6 +717,8 @@ static void lcd_flush(void)
  */
 static void display_init(void)
 {
+  display_mutex = xSemaphoreCreateRecursiveMutex();
+
   ESP_LOGI(TAG_MAIN, "Initializing SPI bus for LCD");
 
   // Configure backlight - turn OFF first, then ON after display init
@@ -755,6 +818,83 @@ static void display_init(void)
   lcd_flush();
 
   ESP_LOGI(TAG_MAIN, "Display initialized successfully");
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * BATTERY
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static adc_oneshot_unit_handle_t battery_adc = NULL;
+static adc_channel_t battery_channel;
+static adc_cali_handle_t battery_cali = NULL;
+
+/**
+ * Set up the ADC for the battery voltage (GPIO10, 1:2 divider)
+ */
+static void battery_init(void)
+{
+  adc_unit_t unit;
+  if (adc_oneshot_io_to_channel(BATTERY_ADC_PIN, &unit, &battery_channel) != ESP_OK)
+    return;
+
+  adc_oneshot_unit_init_cfg_t unit_config = {};
+  unit_config.unit_id = unit;
+  if (adc_oneshot_new_unit(&unit_config, &battery_adc) != ESP_OK)
+  {
+    ESP_LOGW(TAG_MAIN, "Battery ADC not available");
+    battery_adc = NULL;
+    return;
+  }
+
+  adc_oneshot_chan_cfg_t channel_config = {};
+  channel_config.atten = ADC_ATTEN_DB_12;
+  channel_config.bitwidth = ADC_BITWIDTH_12;
+  adc_oneshot_config_channel(battery_adc, battery_channel, &channel_config);
+
+  adc_cali_curve_fitting_config_t cali_config = {};
+  cali_config.unit_id = unit;
+  cali_config.chan = battery_channel;
+  cali_config.atten = ADC_ATTEN_DB_12;
+  cali_config.bitwidth = ADC_BITWIDTH_12;
+  if (adc_cali_create_scheme_curve_fitting(&cali_config, &battery_cali) != ESP_OK)
+    battery_cali = NULL;
+}
+
+/**
+ * Measure the battery voltage (16 samples, smoothed over time)
+ */
+static void battery_sample(void)
+{
+  if (!battery_adc)
+    return;
+
+  int sum = 0;
+  int count = 0;
+  for (int i = 0; i < 16; i++)
+  {
+    int raw, mv;
+    if (adc_oneshot_read(battery_adc, battery_channel, &raw) != ESP_OK)
+      continue;
+    if (battery_cali && adc_cali_raw_to_voltage(battery_cali, raw, &mv) == ESP_OK)
+      sum += mv;
+    else
+      sum += raw * 3100 / 4095; // uncalibrated estimate for 12 dB attenuation
+    count++;
+  }
+  if (count == 0)
+    return;
+
+  int mv = sum / count * BATTERY_DIVIDER;
+  battery_mv = battery_mv < 0 ? mv : (battery_mv * 3 + mv) / 4;
+}
+
+/**
+ * Battery level in percent - same mapping as M5Unified (3.3 V = 0 %, 4.1 V = 100 %)
+ */
+static int battery_percent(void)
+{
+  int level = (battery_mv - 3300) * 100 / 800;
+  return level < 0 ? 0 : (level > 100 ? 100 : level);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -871,6 +1011,9 @@ static esp_err_t save_wifi_config(const repeater_config_t *config)
   nvs_set_u16(nvs_handle, NVS_KEY_WG_KEEPALIVE, config->wg_keepalive);
   nvs_set_str(nvs_handle, NVS_KEY_WG_DNS, config->wg_dns);
 
+  nvs_set_str(nvs_handle, NVS_KEY_ADMIN_PASS, config->admin_password);
+  nvs_set_u16(nvs_handle, NVS_KEY_DISPLAY_TIMEOUT, config->display_timeout);
+
   err = nvs_commit(nvs_handle);
   nvs_close(nvs_handle);
 
@@ -944,6 +1087,11 @@ static esp_err_t load_wifi_config(repeater_config_t *config)
   len = sizeof(config->wg_dns);
   nvs_get_str(nvs_handle, NVS_KEY_WG_DNS, config->wg_dns, &len);
 
+  // Device settings (absent in configs saved by older firmware)
+  len = sizeof(config->admin_password);
+  nvs_get_str(nvs_handle, NVS_KEY_ADMIN_PASS, config->admin_password, &len);
+  nvs_get_u16(nvs_handle, NVS_KEY_DISPLAY_TIMEOUT, &config->display_timeout);
+
   config->configured = true;
   nvs_close(nvs_handle);
 
@@ -969,14 +1117,94 @@ static esp_err_t clear_wifi_config(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * UPLINK RECONNECT
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * Reconnect to the uplink after a growing delay (1 s, 2 s, 4 s ... 60 s).
+ * Never gives up - hotel WiFi drops out and comes back.
+ */
+static void schedule_reconnect(void)
+{
+  if (!reconnect_timer)
+    return;
+
+  ESP_LOGI(TAG_STA, "Reconnecting in %lu s", (unsigned long)(reconnect_delay_ms / 1000));
+  esp_timer_stop(reconnect_timer); // fails harmlessly when not running
+  esp_timer_start_once(reconnect_timer, (uint64_t)reconnect_delay_ms * 1000);
+  reconnect_delay_ms = reconnect_delay_ms * 2 > WIFI_RECONNECT_MAX_MS ? WIFI_RECONNECT_MAX_MS : reconnect_delay_ms * 2;
+}
+
+static void reconnect_timer_cb(void *arg)
+{
+  esp_err_t err = esp_wifi_connect();
+  if (err != ESP_OK)
+  {
+    ESP_LOGW(TAG_STA, "Connect failed to start: %s", esp_err_to_name(err));
+    schedule_reconnect();
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * WEB SERVER HTTP HANDLERS
  * ═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * HTTP Basic authentication for the web panel: any user name, the admin password.
+ * Sends 401 and returns false if the request is not authorized.
+ */
+static bool check_auth(httpd_req_t *req)
+{
+  // No password in setup mode and in configs saved by older firmware
+  if (strlen(stored_config.admin_password) == 0)
+    return true;
+
+  char header[192];
+  if (httpd_req_get_hdr_value_str(req, "Authorization", header, sizeof(header)) == ESP_OK &&
+      strncmp(header, "Basic ", 6) == 0)
+  {
+    unsigned char credentials[144];
+    size_t len = 0;
+    if (mbedtls_base64_decode(credentials, sizeof(credentials) - 1, &len,
+                              (const unsigned char *)header + 6, strlen(header + 6)) == 0)
+    {
+      credentials[len] = '\0';
+      const char *password = strchr((const char *)credentials, ':');
+      if (password && strcmp(password + 1, stored_config.admin_password) == 0)
+        return true;
+    }
+  }
+
+  httpd_resp_set_status(req, "401 Unauthorized");
+  httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"CardRepeater\"");
+  httpd_resp_sendstr(req, "Login required");
+  return false;
+}
+
+/**
+ * Block cross-site form posts: browsers send the origin of the page that
+ * submits a form, which has to be this device
+ */
+static bool is_same_origin(httpd_req_t *req)
+{
+  char origin[80], host[64], expected[80];
+  esp_err_t err = httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin));
+  if (err == ESP_ERR_NOT_FOUND)
+    return true; // not sent by all clients
+  if (err != ESP_OK || httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK)
+    return false;
+  snprintf(expected, sizeof(expected), "http://%s", host);
+  return strcmp(origin, expected) == 0;
+}
 
 /**
  * Root page handler - serves configuration form
  */
 static esp_err_t root_handler(httpd_req_t *req)
 {
+  if (!check_auth(req))
+    return ESP_OK;
+
   httpd_resp_set_type(req, "text/html");
   send_config_html(req, &stored_config);
   return ESP_OK;
@@ -1044,6 +1272,14 @@ static bool read_post_body(httpd_req_t *req, char *buf, size_t buf_len)
  */
 static esp_err_t save_handler(httpd_req_t *req)
 {
+  if (!check_auth(req))
+    return ESP_OK;
+  if (!is_same_origin(req))
+  {
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cross-site request blocked");
+    return ESP_FAIL;
+  }
+
   char *body = (char *)malloc(1536);
   if (!body)
   {
@@ -1144,7 +1380,28 @@ static esp_err_t save_handler(httpd_req_t *req)
     new_config.wg_keepalive = (uint16_t)keepalive;
   }
 
+  /* Device */
+  memset(temp, 0, sizeof(temp));
+  if (parse_query_param(body, "admin_pass", temp, sizeof(new_config.admin_password)) && strlen(temp) > 0)
+  {
+    if (strlen(temp) < ADMIN_PASSWORD_MIN_LEN)
+      error = "Admin password must be at least 8 characters";
+    strncpy(new_config.admin_password, temp, sizeof(new_config.admin_password) - 1);
+  }
+
+  memset(temp, 0, sizeof(temp));
+  if (parse_query_param(body, "disp_off", temp, sizeof(temp)) && strlen(temp) > 0)
+  {
+    int timeout = atoi(temp);
+    if (timeout < 0 || timeout > 65535)
+      error = "Screen timeout must be 0-65535 seconds";
+    new_config.display_timeout = (uint16_t)timeout;
+  }
+
   free(body);
+
+  if (!error && strlen(new_config.admin_password) == 0)
+    error = "Set an admin password for the web panel (Device section)";
 
   if (!error && new_config.wg_enabled)
   {
@@ -1239,11 +1496,32 @@ static void send_json_string(httpd_req_t *req, const char *src)
  */
 static esp_err_t scan_handler(httpd_req_t *req)
 {
+  if (!check_auth(req))
+    return ESP_OK;
+
   wifi_scan_config_t scan_config = {};
   scan_config.show_hidden = false;
 
+  // A connection attempt in progress blocks scanning - pause reconnecting meanwhile
+  bool pause_reconnect = reconnect_timer != NULL && !sta_connected;
+  if (pause_reconnect)
+  {
+    scan_in_progress = true;
+    esp_timer_stop(reconnect_timer);
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
   ESP_LOGI(TAG_STA, "Scanning for networks...");
   esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+
+  if (pause_reconnect)
+  {
+    scan_in_progress = false;
+    reconnect_delay_ms = WIFI_RECONNECT_MIN_MS;
+    schedule_reconnect();
+  }
+
   if (err != ESP_OK)
   {
     // e.g. ESP_ERR_WIFI_STATE while the station is busy connecting
@@ -1303,8 +1581,10 @@ static esp_err_t scan_handler(httpd_req_t *req)
  */
 static esp_err_t captive_redirect_handler(httpd_req_t *req)
 {
+  char location[32];
+  snprintf(location, sizeof(location), "http://%s/", ap_ip_str);
   httpd_resp_set_status(req, "302 Found");
-  httpd_resp_set_hdr(req, "Location", "http://" WEB_CONFIG_IP "/");
+  httpd_resp_set_hdr(req, "Location", location);
   httpd_resp_send(req, NULL, 0);
   return ESP_OK;
 }
@@ -1354,7 +1634,7 @@ static httpd_handle_t start_webserver(void)
     httpd_register_uri_handler(web_server, &captive);
 
     ESP_LOGI(TAG_MAIN, "✓ Web server started successfully");
-    ESP_LOGI(TAG_MAIN, "  Access at: http://192.168.4.1/");
+    ESP_LOGI(TAG_MAIN, "  Access at: http://%s/", ap_ip_str);
 
     return web_server;
   }
@@ -1492,13 +1772,53 @@ static void draw_circle(int x, int y, int radius, uint16_t color)
 }
 
 /**
- * Update Display with beautiful visual UI
+ * Draw the battery level (percentage and icon), right-aligned at right_x
  */
-static void display_update_status(void)
+static void draw_battery(int right_x, int y, uint16_t bg_color)
 {
-  if (!framebuffer)
+  if (battery_mv < 0)
     return;
 
+  int level = battery_percent();
+  uint16_t color = level <= 15 ? RGB565(0, 0, 200) : TERM_GREEN; // red when low
+
+  // 18x9 outline with a 2x5 terminal on the right
+  int x = right_x - 20;
+  lcd_fill_rect(x, y, 18, 9, color);
+  lcd_fill_rect(x + 1, y + 1, 16, 7, bg_color);
+  lcd_fill_rect(x + 18, y + 2, 2, 5, color);
+  lcd_fill_rect(x + 2, y + 2, 14 * level / 100, 5, color);
+
+  char text[12];
+  snprintf(text, sizeof(text), "%d%%", level);
+  lcd_draw_string(x - 4 - (int)strlen(text) * 8, y + 1, text, color, bg_color);
+}
+
+/**
+ * Setup mode screen: how to reach the configuration page
+ */
+static void draw_setup_screen(void)
+{
+  lcd_fill_screen(TERM_BG);
+  lcd_fill_rect(0, 0, 240, 18, TERM_GREEN_DARK);
+  lcd_draw_string(40, 5, "SETUP MODE", TERM_GREEN, TERM_GREEN_DARK);
+  draw_battery(236, 4, TERM_GREEN_DARK);
+
+  lcd_draw_string(5, 30, "WiFi:", TERM_GREEN_DIM, TERM_BG);
+  lcd_draw_string(5, 45, DEFAULT_CONFIG_AP_SSID, TERM_ACCENT, TERM_BG);
+
+  lcd_draw_string(5, 65, "Config IP:", TERM_GREEN_DIM, TERM_BG);
+  lcd_draw_string(5, 80, ap_ip_str, TERM_GREEN, TERM_BG);
+
+  lcd_draw_string(5, 100, "Open browser and", TERM_GREEN_DIM, TERM_BG);
+  lcd_draw_string(5, 113, "visit IP above", TERM_GREEN_DIM, TERM_BG);
+}
+
+/**
+ * Status screen with beautiful visual UI
+ */
+static void draw_status_screen(void)
+{
   // Clear screen with pure black background (terminal style)
   lcd_fill_screen(TERM_BG);
 
@@ -1506,7 +1826,8 @@ static void display_update_status(void)
   // HEADER with Title - Terminal style
   // ═══════════════════════════════════════════════════════════
   lcd_fill_rect(0, 0, 240, 16, TERM_GREEN_DARK);
-  lcd_draw_string(30, 4, "Card Wifi Repeater", TERM_GREEN, TERM_GREEN_DARK);
+  lcd_draw_string(6, 4, "Card Wifi Repeater", TERM_GREEN, TERM_GREEN_DARK);
+  draw_battery(236, 3, TERM_GREEN_DARK);
 
   // ═══════════════════════════════════════════════════════════
   // UPLINK SECTION (Box 1)
@@ -1626,11 +1947,166 @@ static void display_update_status(void)
     lcd_fill_rect(237, config_y, 1, 18, TERM_GREEN_DIM);     // Right
 
     lcd_draw_string(6, config_y + 5, "Config:", TERM_GREEN_DIM, TERM_BG);
-    lcd_draw_string(56, config_y + 5, WEB_CONFIG_IP, TERM_GREEN, TERM_BG);
+    lcd_draw_string(64, config_y + 5, ap_ip_str, TERM_GREEN, TERM_BG);
   }
+}
 
-  // Flush to display
+/**
+ * Redraw the screen for the current mode (skipped while the screen is off)
+ */
+static void display_update_status(void)
+{
+  if (!framebuffer)
+    return;
+
+  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  if (display_on && !reset_screen_shown)
+  {
+    if (config_mode)
+      draw_setup_screen();
+    else
+      draw_status_screen();
+    lcd_flush();
+  }
+  xSemaphoreGiveRecursive(display_mutex);
+}
+
+/**
+ * User activity or an important event: restart the screen timeout,
+ * turn the screen on and redraw it
+ */
+static void display_wake(void)
+{
+  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  last_activity_tick = xTaskGetTickCount();
+  bool was_off = !display_on;
+  display_on = true;
+  display_update_status(); // draw before the backlight comes on
+  if (was_off)
+    gpio_set_level((gpio_num_t)LCD_BL_PIN, 1);
+  xSemaphoreGiveRecursive(display_mutex);
+}
+
+/**
+ * Turn the screen off after `timeout` ticks without activity - no redraws until display_wake()
+ */
+static void display_sleep_if_idle(TickType_t timeout)
+{
+  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  if (display_on && !reset_screen_shown && xTaskGetTickCount() - last_activity_tick >= timeout)
+  {
+    display_on = false;
+    gpio_set_level((gpio_num_t)LCD_BL_PIN, 0);
+    ESP_LOGI(TAG_MAIN, "Screen off (press G0 to wake)");
+  }
+  xSemaphoreGiveRecursive(display_mutex);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * G0 BUTTON, SCREEN TIMEOUT AND FACTORY RESET
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * Factory reset screen - owns the display until the reset is cancelled
+ */
+static void draw_reset_screen(const char *line1, const char *line2)
+{
+  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  reset_screen_shown = true;
+  display_on = true;
+  lcd_fill_screen(TERM_BG);
+  lcd_fill_rect(0, 0, 240, 16, TERM_GREEN_DARK);
+  lcd_draw_string(68, 4, "FACTORY RESET", TERM_GREEN, TERM_GREEN_DARK);
+  lcd_draw_string(8, 50, line1, TERM_ACCENT, TERM_BG);
+  lcd_draw_string(8, 70, line2, TERM_GREEN_DIM, TERM_BG);
   lcd_flush();
+  gpio_set_level((gpio_num_t)LCD_BL_PIN, 1);
+  xSemaphoreGiveRecursive(display_mutex);
+}
+
+/**
+ * Erase all settings and restart into setup mode
+ */
+static void factory_reset(void)
+{
+  ESP_LOGW(TAG_MAIN, "G0 held for %d s - erasing all settings", FACTORY_RESET_HOLD_MS / 1000);
+  clear_wifi_config();
+  draw_reset_screen("Settings erased", "Release G0 to restart");
+
+  // G0 is a strapping pin: restarting while it is held would enter download mode
+  while (gpio_get_level((gpio_num_t)BUTTON_G0_PIN) == 0)
+    vTaskDelay(pdMS_TO_TICKS(50));
+  esp_restart();
+}
+
+/**
+ * UI task: G0 button, screen timeout and battery measurement.
+ * A short press on G0 wakes the screen, holding it for 5 s erases all settings.
+ */
+static void ui_task(void *pvParameters)
+{
+  gpio_config_t button_config = {};
+  button_config.pin_bit_mask = 1ULL << BUTTON_G0_PIN;
+  button_config.mode = GPIO_MODE_INPUT;
+  button_config.pull_up_en = GPIO_PULLUP_ENABLE;
+  gpio_config(&button_config);
+
+  bool was_pressed = false;
+  TickType_t pressed_since = 0;
+  int countdown_shown = -1;
+  TickType_t last_battery_tick = xTaskGetTickCount();
+  last_activity_tick = xTaskGetTickCount();
+
+  while (1)
+  {
+    TickType_t now = xTaskGetTickCount();
+    bool pressed = gpio_get_level((gpio_num_t)BUTTON_G0_PIN) == 0;
+
+    if (pressed && !was_pressed)
+    {
+      pressed_since = now;
+      display_wake();
+    }
+    else if (pressed)
+    {
+      uint32_t held_ms = (now - pressed_since) * portTICK_PERIOD_MS;
+      if (held_ms >= FACTORY_RESET_HOLD_MS)
+      {
+        factory_reset();
+      }
+      else if (held_ms >= 1000)
+      {
+        int remaining = (FACTORY_RESET_HOLD_MS - held_ms + 999) / 1000;
+        if (remaining != countdown_shown)
+        {
+          char line[32];
+          snprintf(line, sizeof(line), "Erasing settings in %d s", remaining);
+          draw_reset_screen(line, "Release G0 to cancel");
+          countdown_shown = remaining;
+        }
+      }
+    }
+    else if (was_pressed)
+    {
+      // Released before the reset: leave the countdown, restart the screen timeout
+      countdown_shown = -1;
+      reset_screen_shown = false;
+      display_wake();
+    }
+    was_pressed = pressed;
+
+    // Screen timeout (the screen stays on in setup mode)
+    if (!config_mode && stored_config.display_timeout > 0 && !pressed)
+      display_sleep_if_idle((TickType_t)stored_config.display_timeout * configTICK_RATE_HZ);
+
+    if (now - last_battery_tick >= pdMS_TO_TICKS(10000))
+    {
+      battery_sample();
+      last_battery_tick = now;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
 }
 
 /**
@@ -1935,6 +2411,50 @@ static void enable_napt(void)
   }
 }
 
+/* AP subnets (/24) to use when the uplink network overlaps the current one */
+static const char *const AP_SUBNET_CANDIDATES[] = {"192.168.4.1", "192.168.44.1", "10.44.0.1", "172.31.44.1"};
+
+/**
+ * True when two IPv4 networks overlap (addresses and masks in network byte order)
+ */
+static bool subnets_overlap(uint32_t a, uint32_t a_mask, uint32_t b, uint32_t b_mask)
+{
+  uint32_t mask = a_mask & b_mask; // mask of the larger network
+  return (a & mask) == (b & mask);
+}
+
+/**
+ * Move the AP to a free subnet if the uplink network overlaps it - with both
+ * interfaces in one subnet clients could not reach the internet
+ */
+static void ensure_ap_subnet_free(const esp_netif_ip_info_t *uplink)
+{
+  esp_netif_ip_info_t ap_info;
+  esp_netif_get_ip_info(ap_netif, &ap_info);
+  if (!subnets_overlap(ap_info.ip.addr, ap_info.netmask.addr, uplink->ip.addr, uplink->netmask.addr))
+    return;
+
+  for (size_t i = 0; i < sizeof(AP_SUBNET_CANDIDATES) / sizeof(AP_SUBNET_CANDIDATES[0]); i++)
+  {
+    esp_netif_ip_info_t candidate = {};
+    candidate.ip.addr = ipaddr_addr(AP_SUBNET_CANDIDATES[i]);
+    candidate.gw.addr = candidate.ip.addr;
+    candidate.netmask.addr = ipaddr_addr("255.255.255.0");
+    if (subnets_overlap(candidate.ip.addr, candidate.netmask.addr, uplink->ip.addr, uplink->netmask.addr))
+      continue;
+
+    ESP_LOGW(TAG_AP, "Uplink address " IPSTR " is in the AP subnet - moving the AP to %s",
+             IP2STR(&uplink->ip), AP_SUBNET_CANDIDATES[i]);
+    esp_netif_dhcps_stop(ap_netif);
+    esp_netif_set_ip_info(ap_netif, &candidate);
+    esp_netif_dhcps_start(ap_netif);
+    strlcpy(ap_ip_str, AP_SUBNET_CANDIDATES[i], sizeof(ap_ip_str));
+    esp_wifi_deauth_sta(0); // clients reconnect and get an address in the new subnet
+    return;
+  }
+  ESP_LOGE(TAG_AP, "No free AP subnet for uplink address " IPSTR, IP2STR(&uplink->ip));
+}
+
 /**
  * WiFi event handler
  */
@@ -1950,7 +2470,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
              event->mac[0], event->mac[1], event->mac[2],
              event->mac[3], event->mac[4], event->mac[5],
              event->aid);
-    display_update_status();
+    display_wake();
   }
   else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED)
   {
@@ -1961,7 +2481,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
              event->mac[0], event->mac[1], event->mac[2],
              event->mac[3], event->mac[4], event->mac[5],
              event->aid);
-    display_update_status();
+    display_wake();
   }
 
   /* Station Events */
@@ -1976,30 +2496,31 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
   }
   else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
   {
-    if (s_retry_num < WIFI_STA_MAXIMUM_RETRY)
-    {
-      esp_wifi_connect();
-      s_retry_num++;
-      ESP_LOGI(TAG_STA, "Retry connecting to AP... (%d/%d)", s_retry_num, WIFI_STA_MAXIMUM_RETRY);
-    }
-    else
-    {
-      xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-      ESP_LOGE(TAG_STA, "Failed to connect to AP after %d attempts", WIFI_STA_MAXIMUM_RETRY);
-    }
+    wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
+    bool was_connected = sta_connected;
     sta_connected = false;
     uplink_state = UPLINK_OFFLINE;
-    display_update_status();
+    ESP_LOGW(TAG_STA, "Uplink disconnected (reason %d)", event->reason);
+
+    // The WiFi scan pauses reconnecting and restarts it when done
+    if (!scan_in_progress)
+      schedule_reconnect();
+
+    if (was_connected)
+      display_wake(); // show that the uplink was lost
+    else
+      display_update_status();
   }
   else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
   {
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     ESP_LOGI(TAG_STA, "✓ Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-    s_retry_num = 0;
+    reconnect_delay_ms = WIFI_RECONNECT_MIN_MS;
     sta_connected = true;
     xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 
-    /* Configure DNS and enable NAPT after getting IP */
+    /* Keep the AP out of the uplink's subnet, then configure DNS and NAPT */
+    ensure_ap_subnet_free(&event->ip_info);
     setup_dns_forwarding();
     if (!napt_enabled)
     {
@@ -2013,7 +2534,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
       xTaskNotifyGive(status_task_handle);
     }
 
-    display_update_status();
+    display_wake();
   }
 }
 
@@ -2065,7 +2586,7 @@ static void wifi_init_sta(void)
   memcpy(wifi_sta_config.sta.ssid, stored_config.sta_ssid, strlen(stored_config.sta_ssid));
   memcpy(wifi_sta_config.sta.password, stored_config.sta_password, strlen(stored_config.sta_password));
   wifi_sta_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-  wifi_sta_config.sta.failure_retry_cnt = WIFI_STA_MAXIMUM_RETRY;
+  wifi_sta_config.sta.failure_retry_cnt = WIFI_STA_DRIVER_RETRIES;
   wifi_sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
   wifi_sta_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
@@ -2081,6 +2602,8 @@ static void status_task(void *pvParameters)
 {
   while (1)
   {
+    uplink_state_t previous_state = uplink_state;
+
     if (sta_connected)
     {
       // Check internet connectivity periodically
@@ -2112,8 +2635,11 @@ static void status_task(void *pvParameters)
       ESP_LOGI(TAG_MAIN, "Waiting for uplink connection...");
     }
 
-    // Update display
-    display_update_status();
+    // Update display - and turn it on when internet access is lost or a portal needs login
+    if (sta_connected && uplink_state != previous_state && uplink_state != UPLINK_ONLINE)
+      display_wake();
+    else
+      display_update_status();
 
     // Update every 10 seconds, or right away when the uplink gets an IP
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000));
@@ -2146,6 +2672,7 @@ extern "C" void app_main(void)
   /* Load configuration */
   stored_config.wg_port = WG_DEFAULT_PORT;
   stored_config.wg_keepalive = WG_DEFAULT_KEEPALIVE;
+  stored_config.display_timeout = DEFAULT_DISPLAY_TIMEOUT;
   ret = load_wifi_config(&stored_config);
   if (ret != ESP_OK)
   {
@@ -2163,26 +2690,9 @@ extern "C" void app_main(void)
     strncpy(stored_config.ap_password, DEFAULT_CONFIG_AP_PASSWORD, sizeof(stored_config.ap_password));
     stored_config.wg_port = WG_DEFAULT_PORT;
     stored_config.wg_keepalive = WG_DEFAULT_KEEPALIVE;
+    stored_config.display_timeout = DEFAULT_DISPLAY_TIMEOUT;
     stored_config.configured = false;
     config_mode = true;
-
-    // Show on display
-    if (framebuffer)
-    {
-      lcd_fill_screen(TERM_BG);
-      lcd_fill_rect(0, 0, 240, 18, TERM_GREEN_DARK);
-      lcd_draw_string(40, 5, "SETUP MODE", TERM_GREEN, TERM_GREEN_DARK);
-
-      lcd_draw_string(5, 30, "WiFi:", TERM_GREEN_DIM, TERM_BG);
-      lcd_draw_string(5, 45, DEFAULT_CONFIG_AP_SSID, TERM_ACCENT, TERM_BG);
-
-      lcd_draw_string(5, 65, "Config IP:", TERM_GREEN_DIM, TERM_BG);
-      lcd_draw_string(5, 80, WEB_CONFIG_IP, TERM_GREEN, TERM_BG);
-
-      lcd_draw_string(5, 100, "Open browser and", TERM_GREEN_DIM, TERM_BG);
-      lcd_draw_string(5, 113, "visit IP above", TERM_GREEN_DIM, TERM_BG);
-      lcd_flush();
-    }
   }
   else
   {
@@ -2195,6 +2705,12 @@ extern "C" void app_main(void)
              stored_config.wg_enabled ? stored_config.wg_endpoint : "disabled");
     config_mode = false;
   }
+
+  /* Battery gauge, G0 button and screen timeout */
+  battery_init();
+  battery_sample();
+  xTaskCreate(ui_task, "ui_task", 4096, NULL, 4, NULL);
+  display_update_status();
 
   /* Initialize TCP/IP stack */
   ESP_ERROR_CHECK(esp_netif_init());
@@ -2268,6 +2784,12 @@ extern "C" void app_main(void)
     wifi_init_softap();
     wifi_init_sta();
 
+    /* Uplink reconnect timer */
+    esp_timer_create_args_t reconnect_timer_args = {};
+    reconnect_timer_args.callback = reconnect_timer_cb;
+    reconnect_timer_args.name = "wifi_reconnect";
+    ESP_ERROR_CHECK(esp_timer_create(&reconnect_timer_args, &reconnect_timer));
+
     /* Create status monitoring task before WiFi starts so it gets notified on connect */
     xTaskCreate(status_task, "status_task", 8192, NULL, 5, &status_task_handle);
 
@@ -2281,31 +2803,15 @@ extern "C" void app_main(void)
     start_webserver();
     display_update_status();
 
-    /* Wait for connection */
+    /* Wait for the first connection - reconnects keep running in the background */
     ESP_LOGI(TAG_MAIN, "Waiting for STA connection...");
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                           pdFALSE,
-                                           pdFALSE,
-                                           portMAX_DELAY);
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 
-    /* Check connection result */
-    if (bits & WIFI_CONNECTED_BIT)
-    {
-      ESP_LOGI(TAG_MAIN, "╔═══════════════════════════════════════╗");
-      ESP_LOGI(TAG_MAIN, "║  ✓ CardRepeater Ready!               ║");
-      ESP_LOGI(TAG_MAIN, "║  Connect to: %-24s║", stored_config.ap_ssid);
-      ESP_LOGI(TAG_MAIN, "║  Config IP: %-26s║", WEB_CONFIG_IP);
-      ESP_LOGI(TAG_MAIN, "║  NAT Status: %-24s║", napt_enabled ? "ENABLED" : "PENDING");
-      ESP_LOGI(TAG_MAIN, "╚═══════════════════════════════════════╝");
-    }
-    else if (bits & WIFI_FAIL_BIT)
-    {
-      ESP_LOGE(TAG_MAIN, "✗ Failed to connect to SSID:%s", stored_config.sta_ssid);
-    }
-    else
-    {
-      ESP_LOGE(TAG_MAIN, "✗ Unexpected event");
-    }
+    ESP_LOGI(TAG_MAIN, "╔═══════════════════════════════════════╗");
+    ESP_LOGI(TAG_MAIN, "║  ✓ CardRepeater Ready!               ║");
+    ESP_LOGI(TAG_MAIN, "║  Connect to: %-24s║", stored_config.ap_ssid);
+    ESP_LOGI(TAG_MAIN, "║  Config IP: %-26s║", ap_ip_str);
+    ESP_LOGI(TAG_MAIN, "║  NAT Status: %-24s║", napt_enabled ? "ENABLED" : "PENDING");
+    ESP_LOGI(TAG_MAIN, "╚═══════════════════════════════════════╝");
   }
 }

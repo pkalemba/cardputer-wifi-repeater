@@ -19,6 +19,8 @@
 - **Dual Mode Operation**: Functions as both Station (uplink) and Access Point simultaneously
 - **Internet Connectivity Check**: HTTP probe (`generate_204`) verifies real internet access
 - **DNS Forwarding**: Seamlessly forwards DNS queries from clients to upstream network
+- **Auto-reconnect**: never gives up on the uplink - retries with a growing delay (1 s up to 60 s) when the WiFi drops out
+- **Subnet conflict handling**: if the uplink network uses the AP's subnet (`192.168.4.x`), the AP moves to `192.168.44.1` (or another free subnet) and the display shows the new address
 
 ### 🔐 WireGuard VPN
 - **Full tunnel**: all client traffic (`0.0.0.0/0`) is routed through a WireGuard peer
@@ -40,9 +42,12 @@
   - 📶 Live client count
   - 🌐 Internet connectivity indicator (Green = online, Yellow = checking, Orange + `LOGIN` = captive portal, Red = offline)
   - 🔐 VPN status (`VPN:ON` / `VPN:RDY` / `VPN:..`)
+  - 🔋 Battery level (turns red at 15 %)
+- **Screen timeout**: the screen turns off after 60 s without activity (configurable, 0 = always on). The **G0** button, a client joining or leaving, and uplink changes turn it back on
 
 ### ⚙️ Web Configuration
 - **Easy Setup**: Web-UI based configuration interface (because I couldn't get the built in keyboard working)
+- **Password protected**: log in with any user name and the admin password set during setup
 
 ## 🚀 Quick Start
 
@@ -94,6 +99,7 @@ When powered on for the first time:
      - **Uplink WiFi**: Network to connect to (internet source) - use **Scan** to list nearby networks
      - **Access Point**: Your repeater's network name and password
      - **WireGuard VPN** (optional): see below
+     - **Device**: admin password for the web panel (required, at least 8 characters) and the screen timeout
 
 3. **Save & Restart**
    - Device automatically reboots into repeater mode
@@ -104,7 +110,20 @@ After configuration:
 - Device connects to upstream WiFi automatically
 - Creates access point for client devices
 - Display shows live status information
-- Web interface remains accessible at `192.168.4.1` for reconfiguration
+- Web interface remains accessible at `192.168.4.1` for reconfiguration (log in with any user
+  name and the admin password). If the uplink network itself uses `192.168.4.x`, the address
+  changes to `192.168.44.1` - the display always shows the current one
+
+> Configs saved by older firmware have no admin password: the panel stays open and shows a
+> warning until you set one.
+
+### G0 Button
+
+- **Press**: turns the screen on
+- **Hold for 5 seconds**: erases all settings. A countdown appears after 1 s - release G0
+  to cancel. When the settings are erased, release G0 and the device restarts into setup mode.
+
+Don't hold G0 while powering on or resetting: that starts the ESP32-S3 download mode instead.
 
 ### Captive Portals (hotels, airports, trains)
 
