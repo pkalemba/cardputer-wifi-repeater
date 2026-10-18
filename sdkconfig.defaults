@@ -29,3 +29,6 @@ CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=6144
 # netif->state, which the WireGuard interface uses for its own data
 # (same workaround as ESPHome, see trombik/esp_wireguard#33)
 CONFIG_LWIP_PPP_SUPPORT=y
+
+# 1500K app partition - the firmware no longer fits in 1M
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
