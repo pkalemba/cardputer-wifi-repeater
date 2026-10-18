@@ -24,3 +24,8 @@ CONFIG_LWIP_MAX_SOCKETS=16
 
 # WireGuard crypto (handshake) runs in the TCP/IP task
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=6144
+
+# WireGuard: makes esp_netif keep its pointer in netif->client_data instead of
+# netif->state, which the WireGuard interface uses for its own data
+# (same workaround as ESPHome, see trombik/esp_wireguard#33)
+CONFIG_LWIP_PPP_SUPPORT=y
