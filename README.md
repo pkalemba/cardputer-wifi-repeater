@@ -153,8 +153,8 @@ forward/NAT traffic from the tunnel to the internet (as for any full-tunnel clie
 Notes:
 - Client traffic goes directly through the uplink until the handshake succeeds,
   and while a captive portal requires login - there is no kill switch.
-- The tunnel MTU is 1420. If some websites hang on large transfers, lower the MTU
-  of your client devices to 1420.
+- The tunnel MTU is 1420 while clients use 1500. The repeater clamps the TCP MSS of
+  connections through the tunnel to 1380, so TCP segments fit without fragmentation.
 - Only IPv4 and one peer are supported.
 
 ### Performance
