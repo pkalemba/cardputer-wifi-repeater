@@ -202,8 +202,8 @@ are attached to the workflow run as the `cardputer-wifi-repeater-<commit>` artif
 
 | File | Flash offset |
 |---|---|
-| `*-factory.bin` | `0x0` - complete image, use this one |
-| `*-app.bin` | `0x10000` - application only |
+| `*-factory.bin` | `0x0` - complete image, for flashing over USB |
+| `*-app.bin` | `0x10000` - application only, the one to install with Launcher |
 | `*-bootloader.bin` / `*-partitions.bin` | `0x0` / `0x8000` |
 | `*.elf` | not flashed - decodes crash backtraces |
 | `*.map` | not flashed - linker map for memory analysis with `esp-idf-size` |
@@ -215,8 +215,19 @@ esptool.py --chip esp32s3 write_flash 0x0 cardputer-wifi-repeater-<version>-fact
 The factory image can also be flashed from a browser with the
 [ESP web flasher](https://espressif.github.io/esptool-js/) at address `0x0`.
 
-Pushing a tag starting with `v` (e.g. `git tag v1.0.0 && git push origin v1.0.0`) also
-publishes a GitHub release with the binaries.
+#### Releases
+
+Every release on the [Releases](../../releases) page has two files attached:
+
+| File | How to flash it |
+|---|---|
+| `*-app.bin` | Cardputer with [Launcher](https://github.com/bmorcelli/Launcher): copy it to the SD card and install it from the `SD` menu, or upload it in Launcher's web interface (`WUI` → `OTA`) |
+| `*-factory.bin` | Over USB at `0x0`, as above. This overwrites the whole flash, Launcher included |
+
+To publish a release, create one on GitHub (*Releases* → *Draft a new release*, type a new
+tag such as `v1.0.1`, *Publish release*) or push a tag starting with `v`
+(`git tag v1.0.1 && git push origin v1.0.1`). CI builds that commit and attaches the two
+files a few minutes later.
 
 #### Does it fit the Cardputer?
 
