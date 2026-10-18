@@ -1246,6 +1246,17 @@ static bool parse_cidr(const char *cidr, char *ip_out, size_t ip_len, char *mask
 }
 
 /**
+ * Copy a form value into a fixed-size config field - false if it does not fit
+ */
+static bool copy_field(char *dst, size_t dst_size, const char *value)
+{
+  if (strlen(value) >= dst_size)
+    return false;
+  strlcpy(dst, value, dst_size);
+  return true;
+}
+
+/**
  * Read a urlencoded POST body into buf (NUL terminated)
  */
 static bool read_post_body(httpd_req_t *req, char *buf, size_t buf_len)
@@ -1342,23 +1353,27 @@ static esp_err_t save_handler(httpd_req_t *req)
   char temp[96] = {0};
   new_config.wg_enabled = parse_query_param(body, "wg_en", temp, sizeof(temp));
   parse_query_param(body, "wg_addr", new_config.wg_address, sizeof(new_config.wg_address));
-  parse_query_param(body, "wg_peer", new_config.wg_peer_public_key, sizeof(new_config.wg_peer_public_key));
   parse_query_param(body, "wg_host", new_config.wg_endpoint, sizeof(new_config.wg_endpoint));
   parse_query_param(body, "wg_dns", new_config.wg_dns, sizeof(new_config.wg_dns));
 
+  // Keys are read in full so that a too long key is rejected instead of truncated
   memset(temp, 0, sizeof(temp));
-  if (parse_query_param(body, "wg_priv", temp, sizeof(temp)) && strlen(temp) > 0)
-  {
-    strncpy(new_config.wg_private_key, temp, sizeof(new_config.wg_private_key) - 1);
-  }
+  if (parse_query_param(body, "wg_peer", temp, sizeof(temp)) &&
+      !copy_field(new_config.wg_peer_public_key, sizeof(new_config.wg_peer_public_key), temp))
+    error = "WireGuard peer public key must be a 44 character base64 key";
+
+  memset(temp, 0, sizeof(temp));
+  if (parse_query_param(body, "wg_priv", temp, sizeof(temp)) && strlen(temp) > 0 &&
+      !copy_field(new_config.wg_private_key, sizeof(new_config.wg_private_key), temp))
+    error = "WireGuard private key must be a 44 character base64 key";
 
   memset(temp, 0, sizeof(temp));
   if (parse_query_param(body, "wg_psk", temp, sizeof(temp)) && strlen(temp) > 0)
   {
     if (strcmp(temp, "-") == 0)
       memset(new_config.wg_preshared_key, 0, sizeof(new_config.wg_preshared_key));
-    else
-      strncpy(new_config.wg_preshared_key, temp, sizeof(new_config.wg_preshared_key) - 1);
+    else if (!copy_field(new_config.wg_preshared_key, sizeof(new_config.wg_preshared_key), temp))
+      error = "WireGuard preshared key must be a 44 character base64 key";
   }
 
   memset(temp, 0, sizeof(temp));
@@ -1382,11 +1397,12 @@ static esp_err_t save_handler(httpd_req_t *req)
 
   /* Device */
   memset(temp, 0, sizeof(temp));
-  if (parse_query_param(body, "admin_pass", temp, sizeof(new_config.admin_password)) && strlen(temp) > 0)
+  if (parse_query_param(body, "admin_pass", temp, sizeof(temp)) && strlen(temp) > 0)
   {
     if (strlen(temp) < ADMIN_PASSWORD_MIN_LEN)
       error = "Admin password must be at least 8 characters";
-    strncpy(new_config.admin_password, temp, sizeof(new_config.admin_password) - 1);
+    else if (!copy_field(new_config.admin_password, sizeof(new_config.admin_password), temp))
+      error = "Admin password must be at most 63 characters";
   }
 
   memset(temp, 0, sizeof(temp));

@@ -157,6 +157,20 @@ Notes:
   of your client devices to 1420.
 - Only IPv4 and one peer are supported.
 
+### Performance
+
+The build is tuned for throughput, following Espressif's iperf example for the ESP32-S3:
+CPU at 240 MHz, compiler optimization for speed (`-O2`), QIO flash, the lwIP packet
+forwarding path in IRAM, WiFi block-ack windows of 16 and the TCP/IP task (NAT and
+WireGuard encryption) pinned to core 1 while WiFi runs on core 0. The trade-off is a
+somewhat higher power draw.
+
+The ESP32-S3 has a single 2.4 GHz radio: the access point and the uplink share one channel
+and every packet crosses the air twice, so a repeater gets at most about half of what a
+direct connection would. Place the Cardputer where the uplink signal on the screen is
+around -65 dBm or better. To measure, run a speed test or `iperf3` on a device connected
+to the repeater.
+
 ### Building from Source
 
 ```bash
