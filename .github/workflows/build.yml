@@ -21,6 +21,7 @@ defaults:
 env:
   PIO_ENV: m5stack-stamps3
   PLATFORMIO_VERSION: 6.1.19
+  ESP_IDF_SIZE_VERSION: 2.3.2
 
 jobs:
   build:
@@ -52,18 +53,18 @@ jobs:
       - name: Install PlatformIO
         run: pip install "platformio==${PLATFORMIO_VERSION}"
 
-      - name: Build
-        run: pio run --environment "$PIO_ENV" 2>&1 | tee build.log
-
-      - name: Firmware size
-        if: ${{ !cancelled() && hashFiles('build.log') != '' }}
+      # Own virtualenv so its dependencies cannot change PlatformIO's
+      - name: Install esp-idf-size
         run: |
-          {
-            echo "### Firmware size (${PIO_ENV})"
-            echo '```'
-            grep -E '^(RAM|Flash):|program size' build.log || echo "No size information in the build log"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          python -m venv ~/esp-idf-size
+          ~/esp-idf-size/bin/pip install "esp-idf-size==${ESP_IDF_SIZE_VERSION}"
+
+      - name: Build
+        run: pio run --environment "$PIO_ENV"
+
+      # Flash layout, app partition, bootloader, PSRAM and free RAM - see scripts/check_fit.py
+      - name: Check that the firmware fits the Cardputer
+        run: ~/esp-idf-size/bin/python scripts/check_fit.py ".pio/build/${PIO_ENV}" --sdkconfig "sdkconfig.${PIO_ENV}" --require-ram
 
       - name: Collect binaries
         id: collect
@@ -84,6 +85,7 @@ jobs:
           cp "${build}/bootloader.bin" "dist/${name}-bootloader.bin"
           cp "${build}/partitions.bin" "dist/${name}-partitions.bin"
           cp "${build}/firmware.elf"   "dist/${name}.elf"
+          cp "${build}"/*.map          "dist/${name}.map"
           ls -l dist
 
           echo "name=${name}" >> "$GITHUB_OUTPUT"

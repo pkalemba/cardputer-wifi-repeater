@@ -164,8 +164,8 @@ a complete image (bootloader + partition table + application) to flash at `0x0`.
 ### Pre-built Firmware (CI)
 
 GitHub Actions (`.github/workflows/build.yml`) builds every push to `main` and every
-pull request. The binaries are attached to the workflow run as the
-`cardputer-wifi-repeater-<commit>` artifact; the run summary shows the firmware size.
+pull request and checks that the firmware fits the Cardputer (see below). The binaries
+are attached to the workflow run as the `cardputer-wifi-repeater-<commit>` artifact.
 
 | File | Flash offset |
 |---|---|
@@ -173,6 +173,7 @@ pull request. The binaries are attached to the workflow run as the
 | `*-app.bin` | `0x10000` - application only |
 | `*-bootloader.bin` / `*-partitions.bin` | `0x0` / `0x8000` |
 | `*.elf` | not flashed - decodes crash backtraces |
+| `*.map` | not flashed - linker map for memory analysis with `esp-idf-size` |
 
 ```bash
 esptool.py --chip esp32s3 write_flash 0x0 cardputer-wifi-repeater-<version>-factory.bin
@@ -183,6 +184,27 @@ The factory image can also be flashed from a browser with the
 
 Pushing a tag starting with `v` (e.g. `git tag v1.0.0 && git push origin v1.0.0`) also
 publishes a GitHub release with the binaries.
+
+#### Does it fit the Cardputer?
+
+After every build `scripts/check_fit.py` checks the firmware against the Cardputer
+(ESP32-S3FN8: 8 MB flash, no PSRAM) and fails the CI run when it would not work:
+
+| Check | Fails when |
+|---|---|
+| Chip / PSRAM | the target is not `esp32s3` or the configuration needs PSRAM |
+| Bootloader | it reaches into the partition table at `0x8000` |
+| Application | it is larger than its partition (warning from 90 %) |
+| Partition table | it ends beyond the configured flash size or the 8 MB chip |
+| Factory image | it is larger than the flash |
+| Free internal RAM | less than 128 KiB is left for the heap (warning below 192 KiB) - the display framebuffer, WiFi, lwIP/NAPT and the web server allocate at runtime |
+
+The results are in the run summary. To run the check locally after `pio run`:
+
+```bash
+pip install esp-idf-size   # needed for the RAM check
+python scripts/check_fit.py
+```
 
 ### Serial Monitor Commands
 
