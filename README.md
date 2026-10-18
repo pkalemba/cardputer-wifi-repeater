@@ -158,6 +158,32 @@ pio run -t upload
 pio device monitor
 ```
 
+Besides `firmware.bin`, every build writes `.pio/build/m5stack-stamps3/factory.bin`:
+a complete image (bootloader + partition table + application) to flash at `0x0`.
+
+### Pre-built Firmware (CI)
+
+GitHub Actions (`.github/workflows/build.yml`) builds every push to `main` and every
+pull request. The binaries are attached to the workflow run as the
+`cardputer-wifi-repeater-<commit>` artifact; the run summary shows the firmware size.
+
+| File | Flash offset |
+|---|---|
+| `*-factory.bin` | `0x0` - complete image, use this one |
+| `*-app.bin` | `0x10000` - application only |
+| `*-bootloader.bin` / `*-partitions.bin` | `0x0` / `0x8000` |
+| `*.elf` | not flashed - decodes crash backtraces |
+
+```bash
+esptool.py --chip esp32s3 write_flash 0x0 cardputer-wifi-repeater-<version>-factory.bin
+```
+
+The factory image can also be flashed from a browser with the
+[ESP web flasher](https://espressif.github.io/esptool-js/) at address `0x0`.
+
+Pushing a tag starting with `v` (e.g. `git tag v1.0.0 && git push origin v1.0.0`) also
+publishes a GitHub release with the binaries.
+
 ### Serial Monitor Commands
 
 View logs at 115200 baud:

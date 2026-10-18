@@ -1,0 +1,124 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PIO_ENV: m5stack-stamps3
+  PLATFORMIO_VERSION: 6.1.19
+
+jobs:
+  build:
+    name: Build firmware
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      artifact: ${{ steps.collect.outputs.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Toolchain, ESP-IDF and its Python environment (~1 GB) - keyed on the
+      # exact Python version because the IDF virtualenv links to it
+      - name: Cache PlatformIO
+        uses: actions/cache@v6
+        with:
+          path: ~/.platformio
+          key: platformio-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            platformio-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-
+
+      - name: Install PlatformIO
+        run: pip install "platformio==${PLATFORMIO_VERSION}"
+
+      - name: Build
+        run: pio run --environment "$PIO_ENV" 2>&1 | tee build.log
+
+      - name: Firmware size
+        if: ${{ !cancelled() && hashFiles('build.log') != '' }}
+        run: |
+          {
+            echo "### Firmware size (${PIO_ENV})"
+            echo '```'
+            grep -E '^(RAM|Flash):|program size' build.log || echo "No size information in the build log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect binaries
+        id: collect
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="${SHA::7}"
+          fi
+          name="cardputer-wifi-repeater-${version}"
+          build=".pio/build/${PIO_ENV}"
+
+          mkdir -p dist
+          cp "${build}/factory.bin"    "dist/${name}-factory.bin"
+          cp "${build}/firmware.bin"   "dist/${name}-app.bin"
+          cp "${build}/bootloader.bin" "dist/${name}-bootloader.bin"
+          cp "${build}/partitions.bin" "dist/${name}-partitions.bin"
+          cp "${build}/firmware.elf"   "dist/${name}.elf"
+          ls -l dist
+
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.collect.outputs.name }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download firmware
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: dist
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.bin --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.bin \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --verify-tag
+          fi
