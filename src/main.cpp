@@ -34,6 +34,7 @@
 #include "lwip/lwip_napt.h"
 #include "lwip/sockets.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/prot/ip.h"
 #include "dhcpserver/dhcpserver.h"
 #include "esp_netif_sntp.h"
 #include "esp_http_client.h"
@@ -180,7 +181,7 @@ static char wg_netmask[16] = {0};
 static bool wg_initialized = false;
 static bool wg_connected = false;
 static bool wg_peer_up = false;
-static bool wg_is_default = false;
+static volatile bool wg_is_default = false; // also read in the TCP/IP task (MSS clamping)
 
 /* Status task handle (notified on uplink changes) */
 static TaskHandle_t status_task_handle = NULL;
@@ -1246,6 +1247,17 @@ static bool parse_cidr(const char *cidr, char *ip_out, size_t ip_len, char *mask
 }
 
 /**
+ * Copy a form value into a fixed-size config field - false if it does not fit
+ */
+static bool copy_field(char *dst, size_t dst_size, const char *value)
+{
+  if (strlen(value) >= dst_size)
+    return false;
+  strlcpy(dst, value, dst_size);
+  return true;
+}
+
+/**
  * Read a urlencoded POST body into buf (NUL terminated)
  */
 static bool read_post_body(httpd_req_t *req, char *buf, size_t buf_len)
@@ -1342,23 +1354,27 @@ static esp_err_t save_handler(httpd_req_t *req)
   char temp[96] = {0};
   new_config.wg_enabled = parse_query_param(body, "wg_en", temp, sizeof(temp));
   parse_query_param(body, "wg_addr", new_config.wg_address, sizeof(new_config.wg_address));
-  parse_query_param(body, "wg_peer", new_config.wg_peer_public_key, sizeof(new_config.wg_peer_public_key));
   parse_query_param(body, "wg_host", new_config.wg_endpoint, sizeof(new_config.wg_endpoint));
   parse_query_param(body, "wg_dns", new_config.wg_dns, sizeof(new_config.wg_dns));
 
+  // Keys are read in full so that a too long key is rejected instead of truncated
   memset(temp, 0, sizeof(temp));
-  if (parse_query_param(body, "wg_priv", temp, sizeof(temp)) && strlen(temp) > 0)
-  {
-    strncpy(new_config.wg_private_key, temp, sizeof(new_config.wg_private_key) - 1);
-  }
+  if (parse_query_param(body, "wg_peer", temp, sizeof(temp)) &&
+      !copy_field(new_config.wg_peer_public_key, sizeof(new_config.wg_peer_public_key), temp))
+    error = "WireGuard peer public key must be a 44 character base64 key";
+
+  memset(temp, 0, sizeof(temp));
+  if (parse_query_param(body, "wg_priv", temp, sizeof(temp)) && strlen(temp) > 0 &&
+      !copy_field(new_config.wg_private_key, sizeof(new_config.wg_private_key), temp))
+    error = "WireGuard private key must be a 44 character base64 key";
 
   memset(temp, 0, sizeof(temp));
   if (parse_query_param(body, "wg_psk", temp, sizeof(temp)) && strlen(temp) > 0)
   {
     if (strcmp(temp, "-") == 0)
       memset(new_config.wg_preshared_key, 0, sizeof(new_config.wg_preshared_key));
-    else
-      strncpy(new_config.wg_preshared_key, temp, sizeof(new_config.wg_preshared_key) - 1);
+    else if (!copy_field(new_config.wg_preshared_key, sizeof(new_config.wg_preshared_key), temp))
+      error = "WireGuard preshared key must be a 44 character base64 key";
   }
 
   memset(temp, 0, sizeof(temp));
@@ -1382,11 +1398,12 @@ static esp_err_t save_handler(httpd_req_t *req)
 
   /* Device */
   memset(temp, 0, sizeof(temp));
-  if (parse_query_param(body, "admin_pass", temp, sizeof(new_config.admin_password)) && strlen(temp) > 0)
+  if (parse_query_param(body, "admin_pass", temp, sizeof(temp)) && strlen(temp) > 0)
   {
     if (strlen(temp) < ADMIN_PASSWORD_MIN_LEN)
       error = "Admin password must be at least 8 characters";
-    strncpy(new_config.admin_password, temp, sizeof(new_config.admin_password) - 1);
+    else if (!copy_field(new_config.admin_password, sizeof(new_config.admin_password), temp))
+      error = "Admin password must be at most 63 characters";
   }
 
   memset(temp, 0, sizeof(temp));
@@ -2257,6 +2274,122 @@ static esp_err_t wg_allow_all_cb(void *ctx)
   return esp_wireguard_add_allowed_ip((wireguard_ctx_t *)ctx, "0.0.0.0", "0.0.0.0");
 }
 
+/*
+ * TCP MSS clamping. The tunnel MTU is 1420, while clients assume 1500: full
+ * size TCP segments would not fit and stall or get fragmented. Lowering the
+ * MSS option of SYN segments in both directions makes both ends send
+ * segments that fit the tunnel.
+ */
+static netif_output_fn wg_output_orig = NULL;
+static netif_output_fn ap_output_orig = NULL;
+static uint16_t tunnel_mss = 0;
+
+/**
+ * Incremental Internet checksum update for one changed 16-bit word (RFC 1624)
+ */
+static uint16_t checksum_replace_word(uint16_t checksum, uint16_t old_word, uint16_t new_word)
+{
+  uint32_t sum = (uint16_t)~checksum + (uint16_t)~old_word + new_word;
+  sum = (sum & 0xFFFF) + (sum >> 16);
+  sum = (sum & 0xFFFF) + (sum >> 16);
+  return (uint16_t)~sum;
+}
+
+/**
+ * Lower the MSS option of an IPv4 TCP SYN segment to max_mss, in place
+ */
+static void clamp_tcp_mss(uint8_t *packet, size_t len, uint16_t max_mss)
+{
+  if (len < 20 || (packet[0] >> 4) != 4 || packet[9] != IP_PROTO_TCP)
+    return;
+  // Only unfragmented packets (MF flag and fragment offset zero)
+  if ((packet[6] & 0x3F) != 0 || packet[7] != 0)
+    return;
+  size_t ip_hlen = (packet[0] & 0x0F) * 4;
+  if (ip_hlen < 20 || len < ip_hlen + 20)
+    return;
+
+  uint8_t *tcp = packet + ip_hlen;
+  size_t tcp_hlen = (tcp[12] >> 4) * 4;
+  if (!(tcp[13] & 0x02) || tcp_hlen < 20 || len < ip_hlen + tcp_hlen)
+    return; // not a SYN or truncated
+
+  for (size_t i = 20; i < tcp_hlen;)
+  {
+    uint8_t kind = tcp[i];
+    if (kind == 0) // end of option list
+      break;
+    if (kind == 1) // NOP
+    {
+      i++;
+      continue;
+    }
+    if (i + 1 >= tcp_hlen || tcp[i + 1] < 2 || i + tcp[i + 1] > tcp_hlen)
+      break; // malformed
+    if (kind == 2 && tcp[i + 1] == 4) // MSS
+    {
+      uint16_t mss = (tcp[i + 2] << 8) | tcp[i + 3];
+      if (mss <= max_mss)
+        return;
+
+      // The value may start at an odd offset and then spans two checksum words
+      size_t first = (i + 2) & ~(size_t)1;
+      size_t words = ((i + 2) & 1) ? 2 : 1;
+      uint16_t old_words[2];
+      for (size_t w = 0; w < words; w++)
+        old_words[w] = (tcp[first + 2 * w] << 8) | tcp[first + 2 * w + 1];
+
+      tcp[i + 2] = max_mss >> 8;
+      tcp[i + 3] = max_mss & 0xFF;
+
+      uint16_t checksum = (tcp[16] << 8) | tcp[17];
+      for (size_t w = 0; w < words; w++)
+        checksum = checksum_replace_word(checksum, old_words[w], (tcp[first + 2 * w] << 8) | tcp[first + 2 * w + 1]);
+      tcp[16] = checksum >> 8;
+      tcp[17] = checksum & 0xFF;
+      return;
+    }
+    i += tcp[i + 1];
+  }
+}
+
+/* Clients -> tunnel: SYN of new connections */
+static err_t wg_output_clamped(struct netif *netif, struct pbuf *p, const ip4_addr_t *addr)
+{
+  clamp_tcp_mss((uint8_t *)p->payload, p->len, tunnel_mss);
+  return wg_output_orig(netif, p, addr);
+}
+
+/* Tunnel -> clients: SYN-ACK of the servers (the AP interface sees all client traffic) */
+static err_t ap_output_clamped(struct netif *netif, struct pbuf *p, const ip4_addr_t *addr)
+{
+  if (wg_is_default)
+    clamp_tcp_mss((uint8_t *)p->payload, p->len, tunnel_mss);
+  return ap_output_orig(netif, p, addr);
+}
+
+/* Wrap the output functions of the tunnel and AP interfaces (TCP/IP task) */
+static esp_err_t wg_install_mss_clamping_cb(void *ctx)
+{
+  struct netif *wg_netif = wg_ctx.netif;
+  struct netif *ap_lwip_netif = (struct netif *)esp_netif_get_netif_impl(ap_netif);
+  if (!wg_netif || !ap_lwip_netif)
+    return ESP_FAIL;
+
+  tunnel_mss = wg_netif->mtu - 40; // IPv4 and TCP headers without options
+  if (wg_netif->output != wg_output_clamped)
+  {
+    wg_output_orig = wg_netif->output;
+    wg_netif->output = wg_output_clamped;
+  }
+  if (ap_lwip_netif->output != ap_output_clamped)
+  {
+    ap_output_orig = ap_lwip_netif->output;
+    ap_lwip_netif->output = ap_output_clamped;
+  }
+  return ESP_OK;
+}
+
 /**
  * Synchronize the clock via SNTP. WireGuard handshakes carry a timestamp
  * and peers reject handshakes older than the last one they have seen, so
@@ -2346,6 +2479,10 @@ static void wireguard_update(void)
       if (err != ESP_OK)
       {
         ESP_LOGE(TAG_MAIN, "WireGuard: failed to allow 0.0.0.0/0: %s", esp_err_to_name(err));
+      }
+      if (esp_netif_tcpip_exec(wg_install_mss_clamping_cb, NULL) == ESP_OK)
+      {
+        ESP_LOGI(TAG_MAIN, "WireGuard: TCP MSS clamped to %u for the tunnel", tunnel_mss);
       }
       wg_connected = true;
       ESP_LOGI(TAG_MAIN, "WireGuard: connecting to %s:%d", stored_config.wg_endpoint, stored_config.wg_port);
