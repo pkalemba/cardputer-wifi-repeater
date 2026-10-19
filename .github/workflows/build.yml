@@ -111,16 +111,29 @@ jobs:
           name: ${{ needs.build.outputs.artifact }}
           path: dist
 
+      # Only the two images people flash - bootloader, partition table, ELF and map
+      # stay in the workflow artifact
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          # Goes above the generated list of changes
+          NOTES: |
+            ## Which file?
+
+            | File | How to flash it |
+            |---|---|
+            | `…-app.bin` | Cardputer with [Launcher](https://github.com/bmorcelli/Launcher): copy it to the SD card and install it from the `SD` menu, or upload it in Launcher's web interface (`WUI` → `OTA`) |
+            | `…-factory.bin` | Over USB with the [ESP web flasher](https://espressif.github.io/esptool-js/) or esptool, at address `0x0`. This overwrites the whole flash, Launcher included |
         run: |
+          files=(dist/*-app.bin dist/*-factory.bin)
           if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/*.bin --clobber
+            # Release created on GitHub: attach the files and keep its notes
+            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/*.bin \
+            gh release create "$GITHUB_REF_NAME" "${files[@]}" \
               --title "$GITHUB_REF_NAME" \
+              --notes "$NOTES" \
               --generate-notes \
               --verify-tag
           fi
