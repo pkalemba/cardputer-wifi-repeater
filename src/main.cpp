@@ -157,6 +157,7 @@ static EventGroupHandle_t s_wifi_event_group;
 static esp_timer_handle_t reconnect_timer = NULL;
 static uint32_t reconnect_delay_ms = WIFI_RECONNECT_MIN_MS;
 static volatile bool scan_in_progress = false;
+static bool sta_open_fallback = false; // password saved, but the uplink turned out to be an open network
 
 /* Network interface handles */
 static esp_netif_t *sta_netif = NULL;
@@ -476,7 +477,8 @@ static const char *html_page_script =
     "if(!l.length){n.textContent='No networks found';return}"
     "l.forEach(function(a){var d=document.createElement('div');d.className='net';"
     "d.textContent=(a.auth?'\\uD83D\\uDD12 ':'')+a.ssid+'  ('+a.rssi+' dBm, ch '+a.ch+')';"
-    "d.onclick=function(){document.getElementById('sta_ssid').value=a.ssid;n.textContent=''};"
+    "d.onclick=function(){document.getElementById('sta_ssid').value=a.ssid;"
+    "if(!a.auth)document.getElementById('sta_pass').value='-';n.textContent=''};"
     "n.appendChild(d)})"
     "}).catch(function(e){n.textContent='Scan failed ('+e+') - uplink may be busy connecting, try again'})}"
     "</script>";
@@ -532,6 +534,8 @@ static void send_status_html(httpd_req_t *req)
     else
       httpd_resp_sendstr_chunk(req, "<br>WireGuard: connecting...");
   }
+  if (sta_open_fallback && sta_connected)
+    httpd_resp_sendstr_chunk(req, "<br>Connected without password - the uplink is an open network");
   if (strlen(probe_info) > 0 && uplink_state != UPLINK_OFFLINE)
   {
     httpd_resp_sendstr_chunk(req, "<div class='diag'>Last check: ");
@@ -586,8 +590,9 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "<button type='button' onclick='scan()'>Scan</button></div>"
                            "<div id='nets'></div>"
                            "<label>Password:</label>"
-                           "<input type='password' name='sta_pass' placeholder='");
-  httpd_resp_sendstr_chunk(req, strlen(config->sta_password) > 0 ? "Leave blank to keep current" : "WiFi password");
+                           "<input type='password' id='sta_pass' name='sta_pass' placeholder='");
+  httpd_resp_sendstr_chunk(req, strlen(config->sta_password) > 0 ? "Blank keeps current, - removes it (open network)"
+                                                                  : "Leave empty for an open network");
   httpd_resp_sendstr_chunk(req,
                            "'></div>"
                            "<div class='section'>"
@@ -1210,6 +1215,27 @@ static esp_err_t clear_wifi_config(void)
  * ═══════════════════════════════════════════════════════════════════ */
 
 /**
+ * Configure the uplink connection. Without a password any network is
+ * accepted (open hotel/airport WiFi). With a password only WPA2 or
+ * better, so a fake open network with the same name is not joined -
+ * unless open is set: the saved network itself is open (see the
+ * fallback in the disconnect handler).
+ */
+static esp_err_t apply_sta_config(bool open)
+{
+  wifi_config_t wifi_sta_config = {};
+  memcpy(wifi_sta_config.sta.ssid, stored_config.sta_ssid, strlen(stored_config.sta_ssid));
+  bool use_password = !open && strlen(stored_config.sta_password) > 0;
+  if (use_password)
+    memcpy(wifi_sta_config.sta.password, stored_config.sta_password, strlen(stored_config.sta_password));
+  wifi_sta_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+  wifi_sta_config.sta.failure_retry_cnt = WIFI_STA_DRIVER_RETRIES;
+  wifi_sta_config.sta.threshold.authmode = use_password ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+  wifi_sta_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+  return esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config);
+}
+
+/**
  * Reconnect to the uplink after a growing delay (1 s, 2 s, 4 s ... 60 s).
  * Never gives up - hotel WiFi drops out and comes back.
  */
@@ -1508,11 +1534,14 @@ static esp_err_t save_handler(httpd_req_t *req)
     error = "Missing sta_ssid";
   }
 
-  // Parse password, but only update if not empty
+  // Parse password, but only update if not empty; "-" removes it (open network)
   char temp_pass[64] = {0};
   if (!error && parse_query_param(body, "sta_pass", temp_pass, sizeof(temp_pass)) && strlen(temp_pass) > 0)
   {
-    strncpy(new_config.sta_password, temp_pass, sizeof(new_config.sta_password));
+    if (strcmp(temp_pass, "-") == 0)
+      memset(new_config.sta_password, 0, sizeof(new_config.sta_password));
+    else
+      strncpy(new_config.sta_password, temp_pass, sizeof(new_config.sta_password));
   }
 
   if (!error && !parse_query_param(body, "ap_ssid", new_config.ap_ssid, sizeof(new_config.ap_ssid)))
@@ -3216,6 +3245,19 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     uplink_state = UPLINK_OFFLINE;
     ESP_LOGW(TAG_STA, "Uplink disconnected (reason %d)", event->reason);
 
+    // No network with the expected security: with a saved password try the
+    // network as an open one, and back (the network may change security)
+    if ((event->reason == WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD ||
+         event->reason == WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY) &&
+        strlen(stored_config.sta_password) > 0 && !scan_in_progress)
+    {
+      sta_open_fallback = !sta_open_fallback;
+      ESP_LOGW(TAG_STA, "%s", sta_open_fallback ? "Uplink may be an open network - connecting without password"
+                                                : "Connecting with the saved password again");
+      apply_sta_config(sta_open_fallback);
+      reconnect_delay_ms = WIFI_RECONNECT_MIN_MS;
+    }
+
     // The WiFi scan pauses reconnecting and restarts it when done
     if (!scan_in_progress)
       schedule_reconnect();
@@ -3293,19 +3335,7 @@ static void wifi_init_softap(void)
 static void wifi_init_sta(void)
 {
   sta_netif = esp_netif_create_default_wifi_sta();
-
-  wifi_config_t wifi_sta_config = {};
-
-  /* Configure STA settings */
-  memcpy(wifi_sta_config.sta.ssid, stored_config.sta_ssid, strlen(stored_config.sta_ssid));
-  memcpy(wifi_sta_config.sta.password, stored_config.sta_password, strlen(stored_config.sta_password));
-  wifi_sta_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-  wifi_sta_config.sta.failure_retry_cnt = WIFI_STA_DRIVER_RETRIES;
-  wifi_sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-  wifi_sta_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
-
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
-
+  ESP_ERROR_CHECK(apply_sta_config(false));
   ESP_LOGI(TAG_STA, "✓ Station configured: connecting to SSID=%s", stored_config.sta_ssid);
 }
 

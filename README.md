@@ -29,6 +29,7 @@
 - **Optional VPN DNS** offered to clients via DHCP
 
 ### 🏨 Captive Portal Support
+- **Open networks**: hotel/airport WiFi without a password works. Leave the uplink password empty, or pick an open network from the scan. With a password saved, the repeater still joins the network if it turns out to be open; enter `-` as the password to remove the saved one
 - **Uplink portal detection**: recognizes hotel/airport login pages and shows `LOGIN` on the display; the web UI links to the login page. Signing in once from any client unlocks internet for all clients (they share the repeater's address)
   - several probes (Google, Apple, Microsoft) and a DNS check, so portals that block all traffic before login are recognized too
   - the web UI shows the result of the last check, to see what the network does
