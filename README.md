@@ -47,6 +47,7 @@
   - 🌐 Internet connectivity indicator (Green = online, Yellow = checking, Orange + `LOGIN` = captive portal, Red + `NO NET` = connected without internet, Red = offline)
   - 🔐 VPN status (`VPN:ON` / `VPN:RDY` / `VPN:..`)
   - 🔋 Battery level (turns red at 15 %)
+- **Battery saving** (web UI, Battery section): lower WiFi transmit power (the biggest consumer; costs range) and eco mode (CPU 80-160 MHz instead of 240 MHz). While online, internet access is checked once a minute instead of every 10 s
 - **Screen timeout**: the screen turns off after 60 s without activity (configurable, 0 = always on). The **G0** button, a client joining or leaving, and uplink changes turn it back on
 
 ### ⚙️ Web Configuration

@@ -41,6 +41,7 @@
 #include "esp_http_client.h"
 #include "esp_app_desc.h"
 #include "esp_random.h"
+#include "esp_pm.h"
 #include "lwip/netdb.h"
 
 // Firmware version (git describe), written by scripts/build_version.py
@@ -103,6 +104,8 @@
 #define NVS_KEY_ADMIN_PASS "admin_pass"
 #define NVS_KEY_DISPLAY_TIMEOUT "disp_off"
 #define NVS_KEY_PORTAL_REDIRECT "portal_redir"
+#define NVS_KEY_TX_POWER "tx_pwr"
+#define NVS_KEY_ECO_MODE "eco"
 
 /* WireGuard defaults */
 #define WG_DEFAULT_PORT 51820
@@ -137,6 +140,8 @@ typedef struct
   char admin_password[64];  // web panel login (empty only in configs from older firmware)
   uint16_t display_timeout; // seconds until the screen turns off, 0 = always on
   bool portal_redirect;     // send clients' connectivity checks to the uplink's login page
+  uint8_t tx_power;         // max WiFi transmit power in dBm, 0 = maximum
+  bool eco_mode;            // CPU 80-160 MHz instead of 240 MHz
 } repeater_config_t;
 
 static repeater_config_t stored_config = {0};
@@ -301,6 +306,7 @@ static const connectivity_probe_t CONNECTIVITY_PROBES[] = {
     {"http://www.msftconnecttest.com/connecttest.txt", 200, "Microsoft Connect Test"},
 };
 #define PROBE_TIMEOUT_MS 8000
+#define CHECK_INTERVAL_ONLINE_MS 60000 // while online; every status cycle (10 s) otherwise
 #define PORTAL_FALLBACK_URL "http://neverssl.com/"
 
 /* Status tracking */
@@ -582,6 +588,7 @@ static const char *html_page_head =
     "label{display:block;margin:10px 0 5px;font-weight:bold;color:#555}"
     "input{width:100%;padding:8px;margin-bottom:15px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}"
     "input[type=checkbox]{width:auto;margin:0 8px 0 0}"
+    "select{width:100%;padding:8px;margin-bottom:15px;border:1px solid #ddd;border-radius:4px}"
     "button{background:#4CAF50;color:white;padding:12px 20px;border:none;border-radius:4px;cursor:pointer;width:100%;font-size:16px}"
     "button:hover{background:#45a049}"
     ".row{display:flex;gap:8px}.row input{flex:1}.row button{width:auto;padding:8px 14px;margin-bottom:15px;font-size:14px}"
@@ -813,6 +820,32 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "show their \"Sign in to network\" page on their own. Clients use this device as DNS server.</div>"
                            "<div class='info'>Log in with any user name and the admin password. "
                            "Press G0 to wake the screen; hold G0 for 5 seconds to erase all settings.</div>"
+                           "</div>"
+                           "<div class='section'>"
+                           "<h2 style='color:#4CAF50;margin-top:0'>Battery</h2>"
+                           "<label>WiFi transmit power:</label><select name='tx_pwr'>");
+  static const struct
+  {
+    uint8_t dbm;
+    const char *label;
+  } TX_POWER_OPTIONS[] = {{0, "Maximum (about 20 dBm)"}, {17, "17 dBm"}, {15, "15 dBm"},
+                          {13, "13 dBm"}, {11, "11 dBm"}, {8, "8 dBm (lowest)"}};
+  for (size_t i = 0; i < sizeof(TX_POWER_OPTIONS) / sizeof(TX_POWER_OPTIONS[0]); i++)
+  {
+    char option[80];
+    snprintf(option, sizeof(option), "<option value='%u'%s>%s</option>", (unsigned)TX_POWER_OPTIONS[i].dbm,
+             config->tx_power == TX_POWER_OPTIONS[i].dbm ? " selected" : "", TX_POWER_OPTIONS[i].label);
+    httpd_resp_sendstr_chunk(req, option);
+  }
+  httpd_resp_sendstr_chunk(req, "</select><label><input type='checkbox' name='eco' value='1'");
+  if (config->eco_mode)
+    httpd_resp_sendstr_chunk(req, " checked");
+  httpd_resp_sendstr_chunk(req,
+                           ">Eco mode: CPU at 80-160 MHz instead of 240 MHz</label>"
+                           "<div class='info'>Lower transmit power saves the most while the uplink and the clients "
+                           "are close; it reduces the range. Eco mode saves some more and lowers the top speed a "
+                           "little (usually still above what hotel WiFi gives). While online, internet access is "
+                           "checked every minute.</div>"
                            "</div>"
                            "<button type='submit'>Save & Restart</button>"
                            "</form>"
@@ -1236,6 +1269,8 @@ static esp_err_t save_wifi_config(const repeater_config_t *config)
   nvs_set_str(nvs_handle, NVS_KEY_ADMIN_PASS, config->admin_password);
   nvs_set_u16(nvs_handle, NVS_KEY_DISPLAY_TIMEOUT, config->display_timeout);
   nvs_set_u8(nvs_handle, NVS_KEY_PORTAL_REDIRECT, config->portal_redirect ? 1 : 0);
+  nvs_set_u8(nvs_handle, NVS_KEY_TX_POWER, config->tx_power);
+  nvs_set_u8(nvs_handle, NVS_KEY_ECO_MODE, config->eco_mode ? 1 : 0);
 
   err = nvs_commit(nvs_handle);
   nvs_close(nvs_handle);
@@ -1319,6 +1354,12 @@ static esp_err_t load_wifi_config(repeater_config_t *config)
   uint8_t portal_redirect = 1;
   nvs_get_u8(nvs_handle, NVS_KEY_PORTAL_REDIRECT, &portal_redirect);
   config->portal_redirect = (portal_redirect == 1);
+
+  // Power settings (absent in configs saved by older firmware: full power)
+  nvs_get_u8(nvs_handle, NVS_KEY_TX_POWER, &config->tx_power);
+  uint8_t eco_mode = 0;
+  nvs_get_u8(nvs_handle, NVS_KEY_ECO_MODE, &eco_mode);
+  config->eco_mode = (eco_mode == 1);
 
   config->configured = true;
   nvs_close(nvs_handle);
@@ -1753,6 +1794,15 @@ static esp_err_t save_handler(httpd_req_t *req)
 
   /* Device */
   new_config.portal_redirect = parse_query_param(body, "portal_redir", temp, sizeof(temp));
+  new_config.eco_mode = parse_query_param(body, "eco", temp, sizeof(temp));
+  memset(temp, 0, sizeof(temp));
+  if (parse_query_param(body, "tx_pwr", temp, sizeof(temp)) && strlen(temp) > 0)
+  {
+    int dbm = atoi(temp);
+    if (dbm != 0 && (dbm < 2 || dbm > 20))
+      error = "WiFi transmit power must be 2-20 dBm";
+    new_config.tx_power = (uint8_t)dbm;
+  }
   memset(temp, 0, sizeof(temp));
   if (parse_query_param(body, "admin_pass", temp, sizeof(temp)) && strlen(temp) > 0)
   {
@@ -2112,6 +2162,13 @@ static esp_err_t debug_handler(httpd_req_t *req)
   if (strlen(portal_url) > 0)
     debug_printf(req, "Login page: %s\n", portal_url);
   debug_printf(req, "Portal redirect for clients: %s\n", stored_config.portal_redirect ? "on" : "off");
+
+  /* Battery */
+  int8_t tx_quarter_dbm = 0;
+  esp_wifi_get_max_tx_power(&tx_quarter_dbm);
+  debug_printf(req, "\n== Power ==\nWiFi transmit power: %d.%02d dBm%s\nEco mode: %s\n", tx_quarter_dbm / 4,
+               (tx_quarter_dbm % 4) * 25, stored_config.tx_power == 0 ? " (maximum)" : "",
+               stored_config.eco_mode ? "on (CPU 80-160 MHz)" : "off (CPU 240 MHz)");
 
   /* Access point */
   debug_printf(req, "\n== Access point ==\nSSID: \"%s\", address %s, channel %d, clients %d\n",
@@ -3768,8 +3825,15 @@ static void status_task(void *pvParameters)
 
     if (sta_connected)
     {
-      // Check internet connectivity periodically
-      check_internet_connectivity();
+      // Check internet connectivity - less often while online (battery)
+      static TickType_t last_check = 0;
+      TickType_t now = xTaskGetTickCount();
+      if (uplink_state != UPLINK_ONLINE || last_check == 0 ||
+          now - last_check >= pdMS_TO_TICKS(CHECK_INTERVAL_ONLINE_MS))
+      {
+        check_internet_connectivity();
+        last_check = xTaskGetTickCount();
+      }
       wireguard_update();
 
       wifi_ap_record_t ap_info;
@@ -3873,6 +3937,14 @@ extern "C" void app_main(void)
     config_mode = false;
   }
 
+  /* CPU clock: eco mode scales between 80 and 160 MHz (no light sleep - the AP must stay up) */
+  esp_pm_config_t pm_config = {};
+  pm_config.max_freq_mhz = stored_config.eco_mode && !config_mode ? 160 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+  pm_config.min_freq_mhz = stored_config.eco_mode && !config_mode ? 80 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+  pm_config.light_sleep_enable = false;
+  esp_err_t pm_err = esp_pm_configure(&pm_config);
+  ESP_LOGI(TAG_MAIN, "CPU clock %d-%d MHz: %s", pm_config.min_freq_mhz, pm_config.max_freq_mhz, esp_err_to_name(pm_err));
+
   /* Battery gauge, G0 button and screen timeout */
   battery_init();
   battery_sample();
@@ -3963,6 +4035,14 @@ extern "C" void app_main(void)
     /* Start WiFi */
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_LOGI(TAG_MAIN, "✓ WiFi started in AP+STA mode");
+
+    /* Battery: transmit power limit (units of 0.25 dBm) */
+    if (stored_config.tx_power > 0)
+    {
+      esp_err_t err = esp_wifi_set_max_tx_power((int8_t)(stored_config.tx_power * 4));
+      ESP_LOGI(TAG_MAIN, "WiFi transmit power limited to %u dBm: %s", (unsigned)stored_config.tx_power,
+               esp_err_to_name(err));
+    }
 
     /* DNS proxy - lets clients open the uplink's captive portal login page */
     if (stored_config.portal_redirect)
