@@ -173,6 +173,11 @@ Notes:
 - The tunnel MTU is 1420 while clients use 1500. The repeater clamps the TCP MSS of
   connections through the tunnel to 1380, so TCP segments fit without fragmentation.
 - Only IPv4 and one peer are supported.
+- WireGuard uses UDP only. Hotel and public networks often block uncommon UDP ports -
+  run the server on UDP 443 (or 53, 123, 4500), which usually gets through.
+- **Debug info** in the web UI shows the tunnel stage, the resolved endpoint and when the
+  last handshake/packet happened. "No answer from the server" means the UDP port is
+  most likely blocked by the network (or the endpoint/keys are wrong).
 
 ### Performance
 

@@ -52,6 +52,7 @@
 
 // WireGuard
 #include "esp_wireguard.h"
+#include "wireguard.h" // peer state for the debug page (library pinned in platformio.ini)
 
 // Battery (ADC) includes
 #include "esp_adc/adc_oneshot.h"
@@ -324,6 +325,25 @@ static char wg_netmask[16] = {0};
 static bool wg_initialized = false;
 static bool wg_connected = false;
 static bool wg_peer_up = false;
+static char wg_status[96] = "disabled";
+static int64_t wg_connect_us = 0; // when the tunnel was started
+
+/* Copy of the peer state shown on the debug page */
+typedef struct
+{
+  bool valid;
+  ip_addr_t endpoint_ip; // resolved endpoint
+  uint16_t endpoint_port;
+  ip_addr_t seen_ip; // where answers came from
+  uint16_t seen_port;
+  uint32_t now;
+  uint32_t latest_handshake; // millis timestamps, 0 = never
+  uint32_t last_initiation_tx;
+  uint32_t last_rx;
+  uint32_t last_tx;
+} wg_peer_snapshot_t;
+
+static esp_err_t wg_snapshot_cb(void *arg); // runs in the TCP/IP task
 static volatile bool wg_is_default = false; // also read in the TCP/IP task (MSS clamping)
 
 /* Status task handle (notified on uplink changes) */
@@ -1973,6 +1993,58 @@ static const char *uplink_state_name(uplink_state_t state)
   }
 }
 
+/* "12s ago" / "never" for a WireGuard millis timestamp */
+static const char *wg_age(char *buf, size_t len, uint32_t now, uint32_t then)
+{
+  if (then == 0)
+    return "never";
+  snprintf(buf, len, "%lus ago", (unsigned long)((now - then) / 1000));
+  return buf;
+}
+
+static void send_wireguard_debug(httpd_req_t *req, int64_t now_us)
+{
+  debug_printf(req, "\n== WireGuard ==\nEndpoint: %s:%u (UDP)\nInterface address: %s, keepalive %us\n",
+               stored_config.wg_endpoint, (unsigned)stored_config.wg_port, stored_config.wg_address,
+               (unsigned)stored_config.wg_keepalive);
+  debug_printf(req, "Stage: %s\n", wg_status);
+
+  time_t t = time(NULL);
+  struct tm utc;
+  gmtime_r(&t, &utc);
+  char clock[32];
+  strftime(clock, sizeof(clock), "%Y-%m-%d %H:%M:%S", &utc);
+  debug_printf(req, "Clock: %s UTC%s\n", clock, t < 1700000000 ? " (not synchronized)" : "");
+
+  if (!wg_connected)
+    return;
+
+  int64_t running_s = (now_us - wg_connect_us) / 1000000;
+  debug_printf(req, "Started: %llds ago\n", (long long)running_s);
+
+  wg_peer_snapshot_t snap = {};
+  if (esp_netif_tcpip_exec(wg_snapshot_cb, &snap) != ESP_OK || !snap.valid)
+  {
+    httpd_resp_sendstr_chunk(req, "Peer: not set up\n");
+    return;
+  }
+
+  char a[24], b[24];
+  debug_printf(req, "Resolved endpoint: %s:%u\n", ipaddr_ntoa_r(&snap.endpoint_ip, a, sizeof(a)), (unsigned)snap.endpoint_port);
+  if (!ip_addr_isany(&snap.seen_ip))
+    debug_printf(req, "Answers from: %s:%u\n", ipaddr_ntoa_r(&snap.seen_ip, b, sizeof(b)), (unsigned)snap.seen_port);
+  debug_printf(req, "Last handshake: %s\n", wg_age(a, sizeof(a), snap.now, snap.latest_handshake));
+  debug_printf(req, "Last handshake attempt sent: %s\n", wg_age(a, sizeof(a), snap.now, snap.last_initiation_tx));
+  debug_printf(req, "Last packet received: %s, sent: %s\n", wg_age(a, sizeof(a), snap.now, snap.last_rx),
+               wg_age(b, sizeof(b), snap.now, snap.last_tx));
+
+  if (snap.latest_handshake == 0 && snap.last_rx == 0 && running_s > 30)
+    debug_printf(req, "\n>> No answer from the server. UDP port %u is probably blocked by this network - "
+                      "try UDP 443, 53, 123 or 4500 on the server. Otherwise check the endpoint, "
+                      "the server's firewall and the keys.\n",
+                 (unsigned)stored_config.wg_port);
+}
+
 /**
  * Debug page (plain text, easy to copy): uplink connection details, the
  * last connectivity check, optionally a WiFi scan (?scan=1) and the recent
@@ -2041,8 +2113,10 @@ static esp_err_t debug_handler(httpd_req_t *req)
   /* Access point */
   debug_printf(req, "\n== Access point ==\nSSID: \"%s\", address %s, channel %d, clients %d\n",
                stored_config.ap_ssid, ap_ip_str, WIFI_AP_CHANNEL, ap_client_count);
+
+  /* WireGuard */
   if (stored_config.wg_enabled)
-    debug_printf(req, "WireGuard: %s\n", wg_is_default ? "routing" : (wg_peer_up ? "peer up" : "connecting"));
+    send_wireguard_debug(req, now);
 
   /* Scan */
   if (scan)
@@ -3165,6 +3239,27 @@ static esp_err_t wg_init_cb(void *ctx) { return esp_wireguard_init(&wg_config, (
 static esp_err_t wg_connect_cb(void *ctx) { return esp_wireguard_connect((wireguard_ctx_t *)ctx); }
 static esp_err_t wg_disconnect_cb(void *ctx) { return esp_wireguard_disconnect((wireguard_ctx_t *)ctx); }
 static esp_err_t wg_peer_is_up_cb(void *ctx) { return esp_wireguard_peer_is_up((wireguard_ctx_t *)ctx); }
+
+static esp_err_t wg_snapshot_cb(void *arg)
+{
+  wg_peer_snapshot_t *snap = (wg_peer_snapshot_t *)arg;
+  if (!wg_ctx.netif || !wg_ctx.netif->state)
+    return ESP_ERR_INVALID_STATE;
+  const struct wireguard_peer *peer = &((struct wireguard_device *)wg_ctx.netif->state)->peers[0];
+  if (!peer->valid)
+    return ESP_ERR_INVALID_STATE;
+  snap->valid = true;
+  snap->endpoint_ip = peer->connect_ip;
+  snap->endpoint_port = peer->connect_port;
+  snap->seen_ip = peer->ip;
+  snap->seen_port = peer->port;
+  snap->now = wireguard_sys_now();
+  snap->latest_handshake = peer->latest_handshake_millis;
+  snap->last_initiation_tx = peer->last_initiation_tx;
+  snap->last_rx = peer->last_rx;
+  snap->last_tx = peer->last_tx;
+  return ESP_OK;
+}
 static esp_err_t wg_set_default_cb(void *ctx) { return esp_wireguard_set_default((wireguard_ctx_t *)ctx); }
 static esp_err_t wg_restore_default_cb(void *ctx) { return esp_wireguard_restore_default((wireguard_ctx_t *)ctx); }
 static esp_err_t wg_allow_all_cb(void *ctx)
@@ -3333,14 +3428,23 @@ static void wireguard_update(void)
   if (!wg_connected)
   {
     // Wait until a captive portal (if any) has been passed
-    if (uplink_state != UPLINK_ONLINE || !wg_sync_time())
+    if (uplink_state != UPLINK_ONLINE)
+    {
+      strlcpy(wg_status, "waiting for internet access on the uplink", sizeof(wg_status));
       return;
+    }
+    if (!wg_sync_time())
+    {
+      strlcpy(wg_status, "waiting for time sync (SNTP, pool.ntp.org)", sizeof(wg_status));
+      return;
+    }
 
     if (!wg_initialized)
     {
       if (!parse_cidr(stored_config.wg_address, wg_ip, sizeof(wg_ip), wg_netmask, sizeof(wg_netmask)))
       {
         ESP_LOGE(TAG_MAIN, "WireGuard: invalid address %s", stored_config.wg_address);
+        strlcpy(wg_status, "invalid interface address", sizeof(wg_status));
         return;
       }
       memset(&wg_config, 0, sizeof(wg_config));
@@ -3357,6 +3461,7 @@ static void wireguard_update(void)
       if (err != ESP_OK)
       {
         ESP_LOGE(TAG_MAIN, "WireGuard: init failed: %s", esp_err_to_name(err));
+        snprintf(wg_status, sizeof(wg_status), "init failed: %s", esp_err_to_name(err));
         return;
       }
       wg_initialized = true;
@@ -3384,11 +3489,18 @@ static void wireguard_update(void)
         ESP_LOGI(TAG_MAIN, "WireGuard: TCP MSS clamped to %u for the tunnel", tunnel_mss);
       }
       wg_connected = true;
+      wg_connect_us = esp_timer_get_time();
+      strlcpy(wg_status, "handshake pending", sizeof(wg_status));
       ESP_LOGI(TAG_MAIN, "WireGuard: connecting to %s:%d", stored_config.wg_endpoint, stored_config.wg_port);
     }
-    else if (err != ESP_ERR_RETRY)
+    else if (err == ESP_ERR_RETRY)
+    {
+      strlcpy(wg_status, "resolving the endpoint host name", sizeof(wg_status));
+    }
+    else
     {
       ESP_LOGE(TAG_MAIN, "WireGuard: connect failed: %s", esp_err_to_name(err));
+      snprintf(wg_status, sizeof(wg_status), "connect failed: %s (endpoint host name?)", esp_err_to_name(err));
       // Reset the interface so the next attempt starts clean
       if (wg_ctx.netif)
         esp_netif_tcpip_exec(wg_disconnect_cb, &wg_ctx);
@@ -3397,6 +3509,8 @@ static void wireguard_update(void)
   }
 
   wg_peer_up = esp_netif_tcpip_exec(wg_peer_is_up_cb, &wg_ctx) == ESP_OK;
+  if (!wg_peer_up)
+    strlcpy(wg_status, "handshake pending", sizeof(wg_status));
 
   // esp_netif may switch the default route back to STA (e.g. after a reconnect),
   // so compare with the actual lwIP default instead of a remembered flag
@@ -3418,6 +3532,10 @@ static void wireguard_update(void)
     ESP_LOGW(TAG_MAIN, "WireGuard: %s - routing directly via uplink",
              wg_peer_up ? "uplink needs login" : "peer down");
   }
+
+  if (wg_peer_up)
+    strlcpy(wg_status, wg_is_default ? "tunnel up, routing client traffic" : "peer up, waiting for internet on the uplink",
+            sizeof(wg_status));
 }
 
 /**
