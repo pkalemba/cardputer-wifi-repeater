@@ -129,6 +129,11 @@ After configuration:
 - **V**: switches the WireGuard VPN on or off (remembered across restarts, same as the
   checkbox in the web UI). The display shows `VPN:OFF` while it is configured but off.
   WireGuard has to be set up in the web UI first.
+- **P**: next lower WiFi transmit power (MAX, 17, 15, 13, 11, 8 dBm, then MAX again)
+- **E**: eco mode on/off (CPU 80-160 MHz instead of 240 MHz)
+
+P and E take effect right away and are remembered (same settings as the Battery section).
+The access point box on the display shows them, e.g. `ECO TX:13`.
 
 The original Cardputer's keyboard (GPIO matrix) is not supported yet.
 

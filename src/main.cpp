@@ -307,6 +307,14 @@ static const connectivity_probe_t CONNECTIVITY_PROBES[] = {
     {"http://www.msftconnecttest.com/connecttest.txt", 200, "Microsoft Connect Test"},
 };
 #define PROBE_TIMEOUT_MS 8000
+/* Transmit power choices (web panel, P key), 0 = maximum */
+static const struct
+{
+  uint8_t dbm;
+  const char *label;
+} TX_POWER_OPTIONS[] = {{0, "Maximum (about 20 dBm)"}, {17, "17 dBm"}, {15, "15 dBm"},
+                        {13, "13 dBm"}, {11, "11 dBm"}, {8, "8 dBm (lowest)"}};
+
 #define CHECK_INTERVAL_ONLINE_MS 60000 // while online; every status cycle (10 s) otherwise
 #define PORTAL_FALLBACK_URL "http://neverssl.com/"
 
@@ -384,7 +392,9 @@ static TaskHandle_t status_task_handle = NULL;
 #define TCA8418_KEY_PRESSED 0x80
 /* Key numbers are row * 10 + column + 1 of the 7x8 matrix (layout as in the
  * M5Cardputer library): V is in the bottom row, 7th key -> matrix row 3, column 3 */
-#define KEY_V 34
+#define KEY_V 34 // VPN on/off
+#define KEY_E 16 // eco mode on/off (2nd row, 4th key)
+#define KEY_P 52 // next transmit power (2nd row, 11th key)
 
 /* M5Stack Cardputer G0 button and battery */
 #define BUTTON_G0_PIN 0            // active low; also a strapping pin (download mode at reset)
@@ -843,12 +853,6 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "<div class='section'>"
                            "<h2 style='color:#4CAF50;margin-top:0'>Battery</h2>"
                            "<label>WiFi transmit power:</label><select name='tx_pwr'>");
-  static const struct
-  {
-    uint8_t dbm;
-    const char *label;
-  } TX_POWER_OPTIONS[] = {{0, "Maximum (about 20 dBm)"}, {17, "17 dBm"}, {15, "15 dBm"},
-                          {13, "13 dBm"}, {11, "11 dBm"}, {8, "8 dBm (lowest)"}};
   for (size_t i = 0; i < sizeof(TX_POWER_OPTIONS) / sizeof(TX_POWER_OPTIONS[0]); i++)
   {
     char option[80];
@@ -2871,6 +2875,14 @@ static void draw_status_screen(void)
     lcd_draw_string(6, ap_y + 25, "Open", TERM_GREEN_DIM, TERM_BG);
   }
 
+  // Power settings (P / E keys), right-aligned
+  char power_str[16];
+  if (stored_config.tx_power == 0)
+    snprintf(power_str, sizeof(power_str), "%sTX:MAX", stored_config.eco_mode ? "ECO " : "");
+  else
+    snprintf(power_str, sizeof(power_str), "%sTX:%u", stored_config.eco_mode ? "ECO " : "", (unsigned)stored_config.tx_power);
+  lcd_draw_string(232 - (int)strlen(power_str) * 8, ap_y + 25, power_str, TERM_GREEN_DIM, TERM_BG);
+
   // Client count (bright green to match theme)
   char clients_str[24];
   snprintf(clients_str, sizeof(clients_str), "CL:%d", ap_client_count);
@@ -2989,6 +3001,62 @@ static void factory_reset(void)
  * A short press on G0 wakes the screen, holding it for 5 s erases all settings.
  */
 /* ═══════════════════════════════════════════════════════════════════
+ * POWER SETTINGS (web panel and E / P keys)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* CPU clock: 80-160 MHz in eco mode, else fixed (no light sleep - the AP must stay up) */
+static void apply_eco_mode(bool eco)
+{
+  esp_pm_config_t pm_config = {};
+  pm_config.max_freq_mhz = eco ? 160 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+  pm_config.min_freq_mhz = eco ? 80 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+  pm_config.light_sleep_enable = false;
+  esp_err_t err = esp_pm_configure(&pm_config);
+  ESP_LOGI(TAG_MAIN, "CPU clock %d-%d MHz: %s", pm_config.min_freq_mhz, pm_config.max_freq_mhz, esp_err_to_name(err));
+}
+
+/* WiFi transmit power limit in dBm, 0 = maximum (the API uses 0.25 dBm units) */
+static void apply_tx_power(uint8_t dbm)
+{
+  esp_err_t err = esp_wifi_set_max_tx_power(dbm == 0 ? 84 : (int8_t)(dbm * 4));
+  ESP_LOGI(TAG_MAIN, "WiFi transmit power %s%u dBm: %s", dbm == 0 ? "max " : "", (unsigned)(dbm == 0 ? 20 : dbm),
+           esp_err_to_name(err));
+}
+
+/* Remember a setting changed with a key (same NVS keys as the web panel) */
+static void save_setting_u8(const char *key, uint8_t value)
+{
+  nvs_handle_t nvs;
+  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK)
+  {
+    nvs_set_u8(nvs, key, value);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+  }
+}
+
+/* P key: next lower transmit power, from the lowest back to maximum */
+static void cycle_tx_power(void)
+{
+  const size_t count = sizeof(TX_POWER_OPTIONS) / sizeof(TX_POWER_OPTIONS[0]);
+  size_t next = 0;
+  for (size_t i = 0; i < count; i++)
+    if (TX_POWER_OPTIONS[i].dbm == stored_config.tx_power)
+      next = (i + 1) % count;
+  stored_config.tx_power = TX_POWER_OPTIONS[next].dbm;
+  apply_tx_power(stored_config.tx_power);
+  save_setting_u8(NVS_KEY_TX_POWER, stored_config.tx_power);
+}
+
+/* E key: eco mode on/off */
+static void toggle_eco_mode(void)
+{
+  stored_config.eco_mode = !stored_config.eco_mode;
+  apply_eco_mode(stored_config.eco_mode);
+  save_setting_u8(NVS_KEY_ECO_MODE, stored_config.eco_mode ? 1 : 0);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * KEYBOARD (Cardputer ADV)
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -3047,7 +3115,7 @@ static bool keyboard_init(void)
   {
   }
   tca8418_write(TCA8418_REG_INT_STAT, 0x03);
-  ESP_LOGI(TAG_MAIN, "✓ Keyboard ready (V toggles the VPN)");
+  ESP_LOGI(TAG_MAIN, "✓ Keyboard ready (V: VPN, P: transmit power, E: eco mode)");
   return true;
 }
 
@@ -3142,6 +3210,16 @@ static void ui_task(void *pvParameters)
     {
       wg_toggle_requested = true;
       xTaskNotifyGive(status_task_handle);
+      display_wake();
+    }
+    else if (key == KEY_P)
+    {
+      cycle_tx_power();
+      display_wake();
+    }
+    else if (key == KEY_E)
+    {
+      toggle_eco_mode();
       display_wake();
     }
     else if (key != 0)
@@ -3981,13 +4059,7 @@ static void wireguard_toggle(void)
   }
   ESP_LOGI(TAG_MAIN, "VPN %s (V key)", enable ? "ON" : "OFF");
 
-  nvs_handle_t nvs;
-  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK)
-  {
-    nvs_set_u8(nvs, NVS_KEY_WG_ENABLED, enable ? 1 : 0);
-    nvs_commit(nvs);
-    nvs_close(nvs);
-  }
+  save_setting_u8(NVS_KEY_WG_ENABLED, enable ? 1 : 0);
 
   if (sta_connected)
     setup_dns_forwarding(); // VPN DNS for clients when portal redirect is off
@@ -4122,13 +4194,8 @@ extern "C" void app_main(void)
     config_mode = false;
   }
 
-  /* CPU clock: eco mode scales between 80 and 160 MHz (no light sleep - the AP must stay up) */
-  esp_pm_config_t pm_config = {};
-  pm_config.max_freq_mhz = stored_config.eco_mode && !config_mode ? 160 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
-  pm_config.min_freq_mhz = stored_config.eco_mode && !config_mode ? 80 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
-  pm_config.light_sleep_enable = false;
-  esp_err_t pm_err = esp_pm_configure(&pm_config);
-  ESP_LOGI(TAG_MAIN, "CPU clock %d-%d MHz: %s", pm_config.min_freq_mhz, pm_config.max_freq_mhz, esp_err_to_name(pm_err));
+  /* CPU clock: eco mode scales between 80 and 160 MHz */
+  apply_eco_mode(stored_config.eco_mode && !config_mode);
 
   /* Battery gauge, G0 button and screen timeout */
   battery_init();
@@ -4221,13 +4288,9 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_LOGI(TAG_MAIN, "✓ WiFi started in AP+STA mode");
 
-    /* Battery: transmit power limit (units of 0.25 dBm) */
+    /* Battery: transmit power limit */
     if (stored_config.tx_power > 0)
-    {
-      esp_err_t err = esp_wifi_set_max_tx_power((int8_t)(stored_config.tx_power * 4));
-      ESP_LOGI(TAG_MAIN, "WiFi transmit power limited to %u dBm: %s", (unsigned)stored_config.tx_power,
-               esp_err_to_name(err));
-    }
+      apply_tx_power(stored_config.tx_power);
 
     /* DNS proxy - lets clients open the uplink's captive portal login page */
     if (stored_config.portal_redirect)
