@@ -4,3 +4,4 @@
 .vscode/launch.json
 .vscode/ipch
 src/firmware_version.h
+__pycache__/
