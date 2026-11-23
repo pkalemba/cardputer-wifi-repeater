@@ -30,6 +30,9 @@
 
 ### 🏨 Captive Portal Support
 - **Uplink portal detection**: recognizes hotel/airport login pages and shows `LOGIN` on the display; the web UI links to the login page. Signing in once from any client unlocks internet for all clients (they share the repeater's address)
+  - several probes (Google, Apple, Microsoft) and a DNS check, so portals that block all traffic before login are recognized too
+  - the web UI shows the result of the last check, to see what the network does
+- **Automatic login page on clients**: while the uplink needs a login, phones and laptops connected to the repeater show their own "Sign in to network" page with the portal's login page. Works through a small DNS proxy on the repeater (can be switched off in the Device section)
 - **Setup captive portal**: in setup mode every DNS name resolves to the repeater, so phones and laptops open the configuration page automatically
 
 ### 📡 WiFi Scanning
@@ -40,7 +43,7 @@
 - **Real-time Status Display**: 
   - 🟢 Uplink connection status with RSSI signal strength
   - 📶 Live client count
-  - 🌐 Internet connectivity indicator (Green = online, Yellow = checking, Orange + `LOGIN` = captive portal, Red = offline)
+  - 🌐 Internet connectivity indicator (Green = online, Yellow = checking, Orange + `LOGIN` = captive portal, Red + `NO NET` = connected without internet, Red = offline)
   - 🔐 VPN status (`VPN:ON` / `VPN:RDY` / `VPN:..`)
   - 🔋 Battery level (turns red at 15 %)
 - **Screen timeout**: the screen turns off after 60 s without activity (configurable, 0 = always on). The **G0** button, a client joining or leaving, and uplink changes turn it back on
@@ -48,6 +51,7 @@
 ### ⚙️ Web Configuration
 - **Easy Setup**: Web-UI based configuration interface (because I couldn't get the built in keyboard working)
 - **Password protected**: log in with any user name and the admin password set during setup
+- **Build info**: the firmware version (`git describe`: release tag or commit) and build time are shown at the bottom of the page
 
 ## 🚀 Quick Start
 
@@ -128,9 +132,18 @@ Don't hold G0 while powering on or resetting: that starts the ESP32-S3 download 
 ### Captive Portals (hotels, airports, trains)
 
 When the uplink network requires a login, the display shows an orange dot with `LOGIN`.
-Connect any device to the repeater, open `http://192.168.4.1` and follow the
-**Open the login page** link (or open any `http://` page). After logging in, the
-status changes to online within ~10 seconds and all clients share the access.
+Connect a phone or laptop to the repeater: it shows its "Sign in to network" notification
+and opens the network's login page, just like on the network itself. You can also open
+`http://192.168.4.1` and follow the **Open the login page** link (or open any `http://` page).
+After logging in, the status changes to online within ~10 seconds and all clients share the access.
+
+If the display shows `NO NET`, the repeater got no answer at all. Clients are sent to
+`http://192.168.4.1/portal`, which links to the uplink's gateway and to `neverssl.com` - many
+portals show their login page there. The **Last check** line in the web UI tells what failed.
+
+To automatically open the login page, the repeater is the DNS server of its clients and
+forwards their queries (to the VPN DNS while the tunnel is up). Switch off **Open the
+uplink's login page on clients** in the Device section to give clients the uplink's DNS server directly.
 
 ### WireGuard VPN
 

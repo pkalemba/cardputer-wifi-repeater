@@ -7,7 +7,8 @@
  * - Provides an Access Point for clients
  * - Routes traffic between them using NAPT
  * - Optionally tunnels all client traffic through WireGuard
- * - Detects captive portals on the uplink network
+ * - Detects captive portals on the uplink network and sends the clients'
+ *   connectivity checks to the login page (DNS proxy)
  * - Acts as a captive portal itself while in setup mode
  */
 
@@ -38,6 +39,14 @@
 #include "dhcpserver/dhcpserver.h"
 #include "esp_netif_sntp.h"
 #include "esp_http_client.h"
+#include "esp_app_desc.h"
+#include "esp_random.h"
+#include "lwip/netdb.h"
+
+// Firmware version (git describe), written by scripts/build_version.py
+#if __has_include("firmware_version.h")
+#include "firmware_version.h"
+#endif
 #include "esp_timer.h"
 #include "mbedtls/base64.h"
 
@@ -92,6 +101,7 @@
 #define NVS_KEY_WG_DNS "wg_dns"
 #define NVS_KEY_ADMIN_PASS "admin_pass"
 #define NVS_KEY_DISPLAY_TIMEOUT "disp_off"
+#define NVS_KEY_PORTAL_REDIRECT "portal_redir"
 
 /* WireGuard defaults */
 #define WG_DEFAULT_PORT 51820
@@ -125,6 +135,7 @@ typedef struct
   /* Device */
   char admin_password[64];  // web panel login (empty only in configs from older firmware)
   uint16_t display_timeout; // seconds until the screen turns off, 0 = always on
+  bool portal_redirect;     // send clients' connectivity checks to the uplink's login page
 } repeater_config_t;
 
 static repeater_config_t stored_config = {0};
@@ -157,14 +168,27 @@ static char ap_ip_str[16] = WEB_CONFIG_IP;
 /* Uplink connectivity state (result of the captive portal probe) */
 typedef enum
 {
-  UPLINK_OFFLINE,  // No STA connection or no response
-  UPLINK_CHECKING, // Connected, probe pending
-  UPLINK_PORTAL,   // Captive portal intercepts traffic - login required
-  UPLINK_ONLINE    // Real internet access confirmed
+  UPLINK_OFFLINE,     // No STA connection
+  UPLINK_CHECKING,    // Connected, probe pending
+  UPLINK_PORTAL,      // Captive portal intercepts traffic - login required
+  UPLINK_NO_INTERNET, // Connected, but no probe got an answer (blocked portal or no internet)
+  UPLINK_ONLINE       // Real internet access confirmed
 } uplink_state_t;
 
-/* Captive portal probe: returns HTTP 204 only with real internet access */
-#define CONNECTIVITY_CHECK_URL "http://connectivitycheck.gstatic.com/generate_204"
+/* Connectivity probes - tried in order until one gets an HTTP answer */
+typedef struct
+{
+  const char *url;
+  int ok_status;       // status of a free internet connection
+  const char *ok_body; // text the body has to contain (NULL = any)
+} connectivity_probe_t;
+
+static const connectivity_probe_t CONNECTIVITY_PROBES[] = {
+    {"http://connectivitycheck.gstatic.com/generate_204", 204, NULL},
+    {"http://captive.apple.com/hotspot-detect.html", 200, "Success"},
+    {"http://www.msftconnecttest.com/connecttest.txt", 200, "Microsoft Connect Test"},
+};
+#define PROBE_TIMEOUT_MS 8000
 #define PORTAL_FALLBACK_URL "http://neverssl.com/"
 
 /* Status tracking */
@@ -172,6 +196,14 @@ static bool sta_connected = false;
 static bool napt_enabled = false;
 static uplink_state_t uplink_state = UPLINK_OFFLINE;
 static char portal_url[256] = {0};
+static char probe_info[192] = {0}; // result of the last connectivity check (web panel diagnostics)
+
+/* Clients' connectivity checks go to this device while the uplink needs a login */
+static bool intercept_portal_probes(void)
+{
+  return stored_config.portal_redirect &&
+         (uplink_state == UPLINK_PORTAL || uplink_state == UPLINK_NO_INTERNET);
+}
 
 /* WireGuard state */
 static wireguard_config_t wg_config = {};
@@ -423,6 +455,8 @@ static const char *html_page_head =
     "button:hover{background:#45a049}"
     ".row{display:flex;gap:8px}.row input{flex:1}.row button{width:auto;padding:8px 14px;margin-bottom:15px;font-size:14px}"
     ".net{padding:8px;margin:0 0 4px;background:#e8f5e9;border-radius:4px;cursor:pointer;font-size:14px}"
+    ".diag{font-size:12px;color:#666;word-break:break-all}"
+    ".build{font-size:12px;color:#888;text-align:center;margin:20px auto}"
     ".net:hover{background:#c8e6c9}"
     ".info{background:#e3f2fd;padding:10px;border-radius:4px;margin:10px 0;border-left:4px solid #2196F3}"
     ".section{margin:20px 0;padding:15px;background:#fafafa;border-radius:4px}"
@@ -466,6 +500,21 @@ static void send_status_html(httpd_req_t *req)
     send_html_escaped(req, strlen(portal_url) > 0 ? portal_url : PORTAL_FALLBACK_URL);
     httpd_resp_sendstr_chunk(req, "' target='_blank'>Open the login page</a> - signing in once unlocks internet for all clients.");
     break;
+  case UPLINK_NO_INTERNET:
+  {
+    httpd_resp_sendstr_chunk(req, "<div class='status err'><b>Uplink connected, but no internet access.</b><br>"
+                                  "If this network has a login page, try ");
+    esp_netif_ip_info_t sta_info;
+    if (esp_netif_get_ip_info(sta_netif, &sta_info) == ESP_OK && sta_info.gw.addr != 0)
+    {
+      char link[96];
+      snprintf(link, sizeof(link), "<a href='http://" IPSTR "/' target='_blank'>the gateway</a> or ",
+               IP2STR(&sta_info.gw));
+      httpd_resp_sendstr_chunk(req, link);
+    }
+    httpd_resp_sendstr_chunk(req, "<a href='" PORTAL_FALLBACK_URL "' target='_blank'>neverssl.com</a>.");
+    break;
+  }
   case UPLINK_CHECKING:
     httpd_resp_sendstr_chunk(req, "<div class='status warn'>Uplink: connected, checking internet...");
     break;
@@ -483,6 +532,32 @@ static void send_status_html(httpd_req_t *req)
     else
       httpd_resp_sendstr_chunk(req, "<br>WireGuard: connecting...");
   }
+  if (strlen(probe_info) > 0 && uplink_state != UPLINK_OFFLINE)
+  {
+    httpd_resp_sendstr_chunk(req, "<div class='diag'>Last check: ");
+    send_html_escaped(req, probe_info);
+    httpd_resp_sendstr_chunk(req, "</div>");
+  }
+  httpd_resp_sendstr_chunk(req, "</div>");
+}
+
+/**
+ * Firmware version (git describe, from scripts/build_version.py) and
+ * build time from the app description ESP-IDF embeds
+ */
+static void send_build_info(httpd_req_t *req)
+{
+  const esp_app_desc_t *app = esp_app_get_description();
+  char line[96];
+  httpd_resp_sendstr_chunk(req, "<div class='build'>Build ");
+#ifdef FIRMWARE_VERSION
+  send_html_escaped(req, FIRMWARE_VERSION);
+#else
+  send_html_escaped(req, app->version);
+#endif
+  snprintf(line, sizeof(line), " &middot; %.16s %.16s &middot; ESP-IDF ", app->date, app->time);
+  httpd_resp_sendstr_chunk(req, line);
+  send_html_escaped(req, app->idf_ver);
   httpd_resp_sendstr_chunk(req, "</div>");
 }
 
@@ -590,13 +665,20 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "<input type='number' name='disp_off' min='0' max='65535' value='");
   snprintf(num, sizeof(num), "%u", config->display_timeout);
   httpd_resp_sendstr_chunk(req, num);
+  httpd_resp_sendstr_chunk(req, "'><label><input type='checkbox' name='portal_redir' value='1'");
+  if (config->portal_redirect)
+    httpd_resp_sendstr_chunk(req, " checked");
   httpd_resp_sendstr_chunk(req,
-                           "'><div class='info'>Log in with any user name and the admin password. "
+                           ">Open the uplink's login page on clients (captive portal)</label>"
+                           "<div class='info'>While the uplink network needs a login, phones and laptops "
+                           "show their \"Sign in to network\" page on their own. Clients use this device as DNS server.</div>"
+                           "<div class='info'>Log in with any user name and the admin password. "
                            "Press G0 to wake the screen; hold G0 for 5 seconds to erase all settings.</div>"
                            "</div>"
                            "<button type='submit'>Save & Restart</button>"
                            "</form>"
                            "<div class='status warn'>Device will restart after saving configuration</div>");
+  send_build_info(req);
   httpd_resp_sendstr_chunk(req, html_page_script);
   httpd_resp_sendstr_chunk(req, "</body></html>");
   httpd_resp_sendstr_chunk(req, NULL);
@@ -1014,6 +1096,7 @@ static esp_err_t save_wifi_config(const repeater_config_t *config)
 
   nvs_set_str(nvs_handle, NVS_KEY_ADMIN_PASS, config->admin_password);
   nvs_set_u16(nvs_handle, NVS_KEY_DISPLAY_TIMEOUT, config->display_timeout);
+  nvs_set_u8(nvs_handle, NVS_KEY_PORTAL_REDIRECT, config->portal_redirect ? 1 : 0);
 
   err = nvs_commit(nvs_handle);
   nvs_close(nvs_handle);
@@ -1092,6 +1175,11 @@ static esp_err_t load_wifi_config(repeater_config_t *config)
   len = sizeof(config->admin_password);
   nvs_get_str(nvs_handle, NVS_KEY_ADMIN_PASS, config->admin_password, &len);
   nvs_get_u16(nvs_handle, NVS_KEY_DISPLAY_TIMEOUT, &config->display_timeout);
+
+  // Portal redirect is on unless it was switched off
+  uint8_t portal_redirect = 1;
+  nvs_get_u8(nvs_handle, NVS_KEY_PORTAL_REDIRECT, &portal_redirect);
+  config->portal_redirect = (portal_redirect == 1);
 
   config->configured = true;
   nvs_close(nvs_handle);
@@ -1198,11 +1286,114 @@ static bool is_same_origin(httpd_req_t *req)
   return strcmp(origin, expected) == 0;
 }
 
+/* What operating systems expect from their connectivity checks on a free connection */
+typedef struct
+{
+  const char *path;
+  const char *status;
+  const char *body;
+} probe_answer_t;
+
+static const probe_answer_t PROBE_ANSWERS[] = {
+    {"/generate_204", "204 No Content", ""},
+    {"/gen_204", "204 No Content", ""},
+    {"/hotspot-detect.html", "200 OK", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"},
+    {"/library/test/success.html", "200 OK", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"},
+    {"/connecttest.txt", "200 OK", "Microsoft Connect Test"},
+    {"/ncsi.txt", "200 OK", "Microsoft NCSI"},
+    {"/success.txt", "200 OK", "success\n"},
+    {"/canonical.html", "200 OK", "<meta http-equiv=\"refresh\" content=\"0;url=https://support.mozilla.org/kb/captive-portal\"/>"},
+};
+
+/**
+ * Connectivity checks of clients reach this server through the DNS proxy
+ * (their Host header is not our address). While the uplink needs a login
+ * they are redirected to the login page, which makes the client open it.
+ * Returns true when the request was such a check and has been answered.
+ */
+static bool handle_portal_probe(httpd_req_t *req)
+{
+  if (config_mode)
+    return false;
+
+  char host[80];
+  if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) == ESP_ERR_NOT_FOUND)
+    return false;
+  char *port = strchr(host, ':');
+  if (port)
+    *port = '\0';
+  if (strcmp(host, ap_ip_str) == 0)
+    return false;
+
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  if (intercept_portal_probes())
+  {
+    char location[sizeof(portal_url)];
+    if (uplink_state == UPLINK_PORTAL)
+      strlcpy(location, strlen(portal_url) > 0 ? portal_url : PORTAL_FALLBACK_URL, sizeof(location));
+    else
+      snprintf(location, sizeof(location), "http://%s/portal", ap_ip_str);
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", location);
+    httpd_resp_send(req, NULL, 0);
+    return true;
+  }
+
+  // Login done but the client still has our address cached - give the free connection answer
+  char path[64];
+  strlcpy(path, req->uri, sizeof(path));
+  char *query = strchr(path, '?');
+  if (query)
+    *query = '\0';
+  for (size_t i = 0; i < sizeof(PROBE_ANSWERS) / sizeof(PROBE_ANSWERS[0]); i++)
+  {
+    if (strcmp(path, PROBE_ANSWERS[i].path) == 0)
+    {
+      httpd_resp_set_status(req, PROBE_ANSWERS[i].status);
+      httpd_resp_set_type(req, "text/html");
+      httpd_resp_sendstr(req, PROBE_ANSWERS[i].body);
+      return true;
+    }
+  }
+
+  // Anything else: send the client to the real server once its DNS cache expired
+  size_t location_len = strlen(host) + strlen(req->uri) + 8;
+  char *location = (char *)malloc(location_len);
+  if (!location)
+    return false;
+  snprintf(location, location_len, "http://%s%s", host, req->uri);
+  httpd_resp_set_status(req, "307 Temporary Redirect");
+  httpd_resp_set_hdr(req, "Location", location);
+  httpd_resp_send(req, NULL, 0);
+  free(location);
+  return true;
+}
+
+/**
+ * Public uplink status page - where clients' connectivity checks lead
+ * while the uplink has no internet access (no login needed)
+ */
+static esp_err_t portal_page_handler(httpd_req_t *req)
+{
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  httpd_resp_sendstr_chunk(req, html_page_head);
+  send_status_html(req);
+  httpd_resp_sendstr_chunk(req, "<div class='info' style='text-align:center'><a href='/'>Repeater settings</a></div>");
+  send_build_info(req);
+  httpd_resp_sendstr_chunk(req, "</body></html>");
+  httpd_resp_sendstr_chunk(req, NULL);
+  return ESP_OK;
+}
+
 /**
  * Root page handler - serves configuration form
  */
 static esp_err_t root_handler(httpd_req_t *req)
 {
+  if (handle_portal_probe(req))
+    return ESP_OK;
   if (!check_auth(req))
     return ESP_OK;
 
@@ -1397,6 +1588,7 @@ static esp_err_t save_handler(httpd_req_t *req)
   }
 
   /* Device */
+  new_config.portal_redirect = parse_query_param(body, "portal_redir", temp, sizeof(temp));
   memset(temp, 0, sizeof(temp));
   if (parse_query_param(body, "admin_pass", temp, sizeof(temp)) && strlen(temp) > 0)
   {
@@ -1598,6 +1790,9 @@ static esp_err_t scan_handler(httpd_req_t *req)
  */
 static esp_err_t captive_redirect_handler(httpd_req_t *req)
 {
+  if (handle_portal_probe(req))
+    return ESP_OK;
+
   char location[32];
   snprintf(location, sizeof(location), "http://%s/", ap_ip_str);
   httpd_resp_set_status(req, "302 Found");
@@ -1642,6 +1837,13 @@ static httpd_handle_t start_webserver(void)
         .user_ctx = NULL};
     httpd_register_uri_handler(web_server, &scan);
 
+    httpd_uri_t portal = {
+        .uri = "/portal",
+        .method = HTTP_GET,
+        .handler = portal_page_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(web_server, &portal);
+
     // Must be registered last - matches everything
     httpd_uri_t captive = {
         .uri = "/*",
@@ -1660,18 +1862,96 @@ static httpd_handle_t start_webserver(void)
   return NULL;
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * DNS SERVERS
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Host names operating systems use to detect captive portals */
+static const char *const PORTAL_PROBE_HOSTS[] = {
+    "connectivitycheck.gstatic.com",
+    "connectivitycheck.android.com",
+    "clients3.google.com",
+    "captive.apple.com",
+    "www.appleiphonecell.com",
+    "www.msftconnecttest.com",
+    "ipv6.msftconnecttest.com",
+    "www.msftncsi.com",
+    "detectportal.firefox.com",
+    "nmcheck.gnome.org",
+    "network-test.debian.org",
+    "connectivity-check.ubuntu.com",
+    "connect.rom.miui.com",
+    "connectivitycheck.platform.hicloud.com",
+};
+
+#define DNS_HEADER_LEN 12
+#define DNS_ANSWER_LEN 16 // A record with a name pointer
+#define DNS_PROXY_SLOTS 16
+#define DNS_PROXY_TIMEOUT_MS 5000
+
 /**
- * Captive portal DNS server (setup mode only).
- * Answers every A query with the AP address so any hostname leads to the config page.
+ * Parse a standard query (QR=0, OPCODE=0) with exactly one question.
+ * Writes the lower case name and type; returns the length of the
+ * question section end (offset) or -1.
  */
-static void captive_dns_task(void *pvParameters)
+static int dns_parse_query(const uint8_t *buf, int len, char *name, size_t name_len, uint16_t *qtype)
+{
+  if (len < DNS_HEADER_LEN || (buf[2] & 0x80) || (buf[2] & 0x78) || buf[4] != 0 || buf[5] != 1)
+    return -1;
+
+  int pos = DNS_HEADER_LEN;
+  size_t out = 0;
+  while (pos < len && buf[pos] != 0)
+  {
+    int label = buf[pos];
+    if ((label & 0xC0) || pos + 1 + label > len)
+      return -1;
+    if (out > 0 && out < name_len - 1)
+      name[out++] = '.';
+    for (int i = 0; i < label; i++)
+      if (out < name_len - 1)
+        name[out++] = (char)tolower(buf[pos + 1 + i]);
+    pos += label + 1;
+  }
+  name[out] = '\0';
+  pos++; // zero length root label
+  if (pos + 4 > len)
+    return -1;
+  *qtype = (buf[pos] << 8) | buf[pos + 1];
+  return pos + 4;
+}
+
+/**
+ * Turn the query in buf into an answer in place. With an address (network
+ * byte order) an A
+ * record follows the question (buf needs DNS_ANSWER_LEN spare bytes),
+ * otherwise the answer is empty. Returns the answer length.
+ */
+static int dns_build_answer(uint8_t *buf, int question_end, const uint32_t *addr, uint32_t ttl)
+{
+  buf[2] = 0x84 | (buf[2] & 0x01); // QR, AA, keep RD
+  buf[3] = 0x80;                   // RA, NOERROR
+  buf[6] = 0;
+  buf[7] = addr ? 1 : 0;      // ANCOUNT
+  memset(&buf[8], 0, 4);      // NSCOUNT, ARCOUNT - drops any EDNS record
+  if (!addr)
+    return question_end;
+
+  const uint8_t record[12] = {0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01,
+                              (uint8_t)(ttl >> 24), (uint8_t)(ttl >> 16), (uint8_t)(ttl >> 8), (uint8_t)ttl,
+                              0x00, 0x04};
+  memcpy(&buf[question_end], record, sizeof(record));
+  memcpy(&buf[question_end + 12], addr, 4);
+  return question_end + DNS_ANSWER_LEN;
+}
+
+static int dns_open_server_socket(void)
 {
   int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (sock < 0)
   {
     ESP_LOGE(TAG_MAIN, "DNS: failed to create socket");
-    vTaskDelete(NULL);
-    return;
+    return -1;
   }
 
   struct sockaddr_in addr = {};
@@ -1682,6 +1962,20 @@ static void captive_dns_task(void *pvParameters)
   {
     ESP_LOGE(TAG_MAIN, "DNS: failed to bind port 53");
     close(sock);
+    return -1;
+  }
+  return sock;
+}
+
+/**
+ * Captive portal DNS server (setup mode only).
+ * Answers every A query with the AP address so any hostname leads to the config page.
+ */
+static void captive_dns_task(void *pvParameters)
+{
+  int sock = dns_open_server_socket();
+  if (sock < 0)
+  {
     vTaskDelete(NULL);
     return;
   }
@@ -1691,42 +1985,192 @@ static void captive_dns_task(void *pvParameters)
   ESP_LOGI(TAG_MAIN, "✓ Captive portal DNS started (all names -> " IPSTR ")", IP2STR(&ip_info.ip));
 
   uint8_t buf[512];
+  char name[128];
   while (1)
   {
     struct sockaddr_in client;
     socklen_t client_len = sizeof(client);
-    // Leave room for the 16 byte answer record
-    int len = recvfrom(sock, buf, sizeof(buf) - 16, 0, (struct sockaddr *)&client, &client_len);
+    int len = recvfrom(sock, buf, sizeof(buf) - DNS_ANSWER_LEN, 0, (struct sockaddr *)&client, &client_len);
 
-    // Only standard queries (QR=0, OPCODE=0) with exactly one question
-    if (len < 12 || (buf[2] & 0x80) || (buf[2] & 0x78) || buf[4] != 0 || buf[5] != 1)
+    uint16_t qtype;
+    int question_end = dns_parse_query(buf, len, name, sizeof(name), &qtype);
+    if (question_end < 0)
       continue;
-
-    // Skip QNAME labels
-    int pos = 12;
-    while (pos < len && buf[pos] != 0)
-      pos += buf[pos] + 1;
-    if (pos + 5 > len)
-      continue;
-    uint16_t qtype = (buf[pos + 1] << 8) | buf[pos + 2];
-    int resp_len = pos + 5; // drop any additional records (EDNS)
 
     bool answer = (qtype == 1 /* A */ || qtype == 255 /* ANY */);
-    buf[2] = 0x84 | (buf[2] & 0x01); // QR, AA, keep RD
-    buf[3] = 0x80;                   // RA, NOERROR
-    buf[6] = 0;
-    buf[7] = answer ? 1 : 0; // ANCOUNT
-    memset(&buf[8], 0, 4);   // NSCOUNT, ARCOUNT
+    int resp_len = dns_build_answer(buf, question_end, answer ? &ip_info.ip.addr : NULL, 60);
+    sendto(sock, buf, resp_len, 0, (struct sockaddr *)&client, client_len);
+  }
+}
 
-    if (answer)
+static bool is_portal_probe_host(const char *name)
+{
+  for (size_t i = 0; i < sizeof(PORTAL_PROBE_HOSTS) / sizeof(PORTAL_PROBE_HOSTS[0]); i++)
+    if (strcmp(name, PORTAL_PROBE_HOSTS[i]) == 0)
+      return true;
+  return false;
+}
+
+/**
+ * DNS server the proxy forwards to: the VPN DNS while the tunnel carries
+ * the traffic, otherwise the uplink's DNS server
+ */
+static bool dns_upstream_server(ip4_addr_t *server)
+{
+  if (stored_config.wg_enabled && wg_is_default && strlen(stored_config.wg_dns) > 0 &&
+      ip4addr_aton(stored_config.wg_dns, server))
+    return true;
+  if (!sta_connected)
+    return false;
+
+  esp_netif_dns_info_t dns = {};
+  if (esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns) != ESP_OK ||
+      dns.ip.type != ESP_IPADDR_TYPE_V4 || dns.ip.u_addr.ip4.addr == 0)
+    return false;
+
+  // Never forward to ourselves
+  esp_netif_ip_info_t ap_info;
+  esp_netif_get_ip_info(ap_netif, &ap_info);
+  if (dns.ip.u_addr.ip4.addr == ap_info.ip.addr)
+    return false;
+
+  server->addr = dns.ip.u_addr.ip4.addr;
+  return true;
+}
+
+typedef struct
+{
+  bool used;
+  uint16_t client_id;   // query ID chosen by the client
+  uint16_t upstream_id; // query ID sent upstream
+  struct sockaddr_in client;
+  struct sockaddr_in server;
+  TickType_t sent;
+} dns_pending_t;
+
+/**
+ * DNS proxy for AP clients (normal mode, when portal redirect is enabled).
+ *
+ * Forwards queries to the upstream DNS server. While the uplink needs a
+ * captive portal login, the host names operating systems use for their
+ * connectivity checks resolve to this device instead, whose web server
+ * redirects the check to the login page - clients then open the login
+ * page on their own.
+ */
+static void dns_proxy_task(void *pvParameters)
+{
+  int sock = dns_open_server_socket();
+  int upstream = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock < 0 || upstream < 0)
+  {
+    ESP_LOGE(TAG_MAIN, "DNS proxy: no sockets");
+    if (sock >= 0)
+      close(sock);
+    if (upstream >= 0)
+      close(upstream);
+    vTaskDelete(NULL);
+    return;
+  }
+  ESP_LOGI(TAG_MAIN, "✓ DNS proxy started");
+
+  static uint8_t buf[1500];
+  static dns_pending_t pending[DNS_PROXY_SLOTS];
+  char name[128];
+  uint16_t next_id = (uint16_t)esp_random();
+
+  while (1)
+  {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+    FD_SET(upstream, &fds);
+    struct timeval tv = {1, 0};
+    if (select((sock > upstream ? sock : upstream) + 1, &fds, NULL, NULL, &tv) <= 0)
+      continue;
+
+    /* Query from a client */
+    if (FD_ISSET(sock, &fds))
     {
-      const uint8_t record[12] = {0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04};
-      memcpy(&buf[resp_len], record, sizeof(record));
-      memcpy(&buf[resp_len + 12], &ip_info.ip.addr, 4);
-      resp_len += 16;
+      struct sockaddr_in client;
+      socklen_t client_len = sizeof(client);
+      int len = recvfrom(sock, buf, sizeof(buf) - DNS_ANSWER_LEN, 0, (struct sockaddr *)&client, &client_len);
+
+      // Only serve the AP subnet - no open resolver on the uplink side
+      esp_netif_ip_info_t ap_info;
+      esp_netif_get_ip_info(ap_netif, &ap_info);
+      bool from_ap = ((client.sin_addr.s_addr ^ ap_info.ip.addr) & ap_info.netmask.addr) == 0;
+
+      uint16_t qtype = 0;
+      int question_end = (from_ap && len > 0) ? dns_parse_query(buf, len, name, sizeof(name), &qtype) : -1;
+      ip4_addr_t server;
+
+      if (!from_ap || len < DNS_HEADER_LEN)
+      {
+        // ignore
+      }
+      else if (question_end > 0 && intercept_portal_probes() && is_portal_probe_host(name))
+      {
+        // A record pointing to us, no IPv6 address - TTL 0 so the real address is used after login
+        int resp_len = dns_build_answer(buf, question_end, qtype == 1 ? &ap_info.ip.addr : NULL, 0);
+        sendto(sock, buf, resp_len, 0, (struct sockaddr *)&client, client_len);
+        ESP_LOGD(TAG_MAIN, "DNS proxy: %s -> portal redirect", name);
+      }
+      else if (dns_upstream_server(&server))
+      {
+        // Reuse a free or timed out slot, else the oldest one
+        TickType_t now = xTaskGetTickCount();
+        dns_pending_t *slot = &pending[0];
+        for (int i = 0; i < DNS_PROXY_SLOTS; i++)
+        {
+          if (!pending[i].used || (now - pending[i].sent) > pdMS_TO_TICKS(DNS_PROXY_TIMEOUT_MS))
+          {
+            slot = &pending[i];
+            break;
+          }
+          if ((now - pending[i].sent) > (now - slot->sent))
+            slot = &pending[i];
+        }
+
+        slot->used = true;
+        slot->client_id = (buf[0] << 8) | buf[1];
+        slot->upstream_id = next_id++;
+        slot->client = client;
+        slot->server = {};
+        slot->server.sin_family = AF_INET;
+        slot->server.sin_port = htons(53);
+        slot->server.sin_addr.s_addr = server.addr;
+        slot->sent = now;
+
+        buf[0] = slot->upstream_id >> 8;
+        buf[1] = slot->upstream_id & 0xFF;
+        sendto(upstream, buf, len, 0, (struct sockaddr *)&slot->server, sizeof(slot->server));
+      }
     }
 
-    sendto(sock, buf, resp_len, 0, (struct sockaddr *)&client, client_len);
+    /* Answer from the upstream server */
+    if (FD_ISSET(upstream, &fds))
+    {
+      struct sockaddr_in from;
+      socklen_t from_len = sizeof(from);
+      int len = recvfrom(upstream, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
+      if (len < DNS_HEADER_LEN)
+        continue;
+
+      uint16_t id = (buf[0] << 8) | buf[1];
+      for (int i = 0; i < DNS_PROXY_SLOTS; i++)
+      {
+        dns_pending_t *slot = &pending[i];
+        if (slot->used && slot->upstream_id == id &&
+            from.sin_addr.s_addr == slot->server.sin_addr.s_addr && from.sin_port == slot->server.sin_port)
+        {
+          buf[0] = slot->client_id >> 8;
+          buf[1] = slot->client_id & 0xFF;
+          sendto(sock, buf, len, 0, (struct sockaddr *)&slot->client, sizeof(slot->client));
+          slot->used = false;
+          break;
+        }
+      }
+    }
   }
 }
 
@@ -1889,6 +2333,11 @@ static void draw_status_screen(void)
     {
       lcd_draw_string(160, uplink_y + 3, "LOGIN", TERM_ACCENT, TERM_BG);
       draw_circle(228, uplink_y + 7, 5, RGB565(0, 165, 255)); // Orange = Captive portal, login required
+    }
+    else if (uplink_state == UPLINK_NO_INTERNET)
+    {
+      lcd_draw_string(152, uplink_y + 3, "NO NET", TERM_GREEN_DIM, TERM_BG);
+      draw_circle(228, uplink_y + 7, 5, RGB565(0, 0, 200)); // Red = Connected, but no internet
     }
     else if (uplink_state == UPLINK_CHECKING)
     {
@@ -2147,14 +2596,34 @@ static void set_ap_dhcp_dns(const esp_netif_dns_info_t *dns)
 }
 
 /**
+ * Offer this device as DNS server to AP clients (DNS proxy)
+ */
+static void offer_dns_proxy(void)
+{
+  esp_netif_ip_info_t ap_ip;
+  esp_netif_get_ip_info(ap_netif, &ap_ip);
+  esp_netif_dns_info_t dns = {};
+  dns.ip.type = ESP_IPADDR_TYPE_V4;
+  dns.ip.u_addr.ip4 = ap_ip.ip;
+  set_ap_dhcp_dns(&dns);
+}
+
+/**
  * Forward DNS settings from STA interface to AP's DHCP server
- * (or offer the configured VPN DNS when WireGuard is enabled)
+ * (or offer the configured VPN DNS when WireGuard is enabled).
+ * With portal redirect clients use the DNS proxy, which forwards instead.
  */
 static void setup_dns_forwarding(void)
 {
   if (!sta_netif || !ap_netif)
   {
     ESP_LOGE(TAG_MAIN, "Network interfaces not initialized");
+    return;
+  }
+
+  if (stored_config.portal_redirect)
+  {
+    offer_dns_proxy(); // the AP address may have changed (subnet conflict)
     return;
   }
 
@@ -2195,13 +2664,111 @@ static esp_err_t probe_http_event_handler(esp_http_client_event_t *evt)
   return ESP_OK;
 }
 
+typedef enum
+{
+  PROBE_ONLINE, // the expected answer of a free internet connection
+  PROBE_PORTAL, // some other HTTP answer - a captive portal intercepts traffic
+  PROBE_FAILED  // no HTTP answer at all
+} probe_result_t;
+
+/**
+ * Run one connectivity probe over the uplink interface (independent of the
+ * WireGuard tunnel). Stores a redirect target in location and a short
+ * description of the result in info.
+ */
+static probe_result_t run_connectivity_probe(const connectivity_probe_t *probe, char *location,
+                                             char *info, size_t info_len)
+{
+  struct ifreq ifr = {};
+  esp_netif_get_netif_impl_name(sta_netif, ifr.ifr_name);
+
+  location[0] = '\0';
+  esp_http_client_config_t config = {};
+  config.url = probe->url;
+  config.timeout_ms = PROBE_TIMEOUT_MS;
+  config.disable_auto_redirect = true;
+  config.event_handler = probe_http_event_handler;
+  config.user_data = location;
+  config.if_name = &ifr;
+
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (!client)
+  {
+    snprintf(info, info_len, "%s: out of memory", probe->url);
+    return PROBE_FAILED;
+  }
+
+  probe_result_t result = PROBE_FAILED;
+  esp_err_t err = esp_http_client_open(client, 0);
+  if (err != ESP_OK)
+  {
+    snprintf(info, info_len, "%s: %s", probe->url, esp_err_to_name(err));
+  }
+  else if (esp_http_client_fetch_headers(client) < 0)
+  {
+    snprintf(info, info_len, "%s: no HTTP answer", probe->url);
+  }
+  else
+  {
+    int status = esp_http_client_get_status_code(client);
+    char body[96];
+    int len = esp_http_client_read(client, body, sizeof(body) - 1);
+    body[len > 0 ? len : 0] = '\0';
+
+    bool ok = status == probe->ok_status && (!probe->ok_body || strstr(body, probe->ok_body));
+    result = ok ? PROBE_ONLINE : PROBE_PORTAL;
+    snprintf(info, info_len, "%s: HTTP %d%s", probe->url, status, ok ? " (OK)" : "");
+  }
+
+  esp_http_client_close(client);
+  esp_http_client_cleanup(client);
+  return result;
+}
+
+/**
+ * Captive portals that block all traffic often answer DNS queries for
+ * every name with their own (private) address. Returns true and the
+ * portal address as login URL when the probe host resolves like that.
+ */
+static bool detect_dns_hijack(char *location, size_t location_len, char *info, size_t info_len)
+{
+  struct addrinfo hints = {};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo *res = NULL;
+  if (getaddrinfo("connectivitycheck.gstatic.com", NULL, &hints, &res) != 0 || !res)
+  {
+    snprintf(info, info_len, "DNS: no answer from the uplink DNS server");
+    return false;
+  }
+  ip4_addr_t addr;
+  addr.addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr;
+  freeaddrinfo(res);
+
+  uint32_t a = ntohl(addr.addr);
+  bool hijacked = (a >> 24) == 10 ||                // 10.0.0.0/8
+                  (a >> 20) == ((172 << 4) | 1) ||  // 172.16.0.0/12
+                  (a >> 16) == ((192 << 8) | 168) || // 192.168.0.0/16
+                  (a >> 22) == ((100 << 2) | 1) ||  // 100.64.0.0/10 (CGNAT)
+                  a == 0x01010101;                  // 1.1.1.1 - common virtual portal address
+
+  char ip[16];
+  ip4addr_ntoa_r(&addr, ip, sizeof(ip));
+  snprintf(info, info_len, "DNS: connectivitycheck.gstatic.com -> %s%s", ip,
+           hijacked ? " (redirected by the network)" : "");
+  if (hijacked)
+    snprintf(location, location_len, "http://%s/", ip);
+  return hijacked;
+}
+
 /**
  * Check internet connectivity and detect captive portals.
  *
- * Requests a URL that returns an empty HTTP 204 on a free internet
- * connection. A redirect or any other answer means a captive portal
- * intercepts traffic. The request is bound to the uplink interface so
- * the result is independent of the WireGuard tunnel.
+ * Requests URLs that give a known answer on a free internet connection.
+ * Any other HTTP answer means a captive portal intercepts traffic. When
+ * no probe gets an answer, a DNS answer pointing to a private address
+ * still reveals a portal. The requests are bound to the uplink interface
+ * so the result is independent of the WireGuard tunnel.
  */
 static void check_internet_connectivity(void)
 {
@@ -2213,48 +2780,58 @@ static void check_internet_connectivity(void)
 
   ESP_LOGI(TAG_MAIN, "Checking internet connectivity...");
 
-  struct ifreq ifr = {};
-  esp_netif_get_netif_impl_name(sta_netif, ifr.ifr_name);
+  char location[sizeof(portal_url)];
+  char info[sizeof(probe_info)];
+  char portal_location[sizeof(portal_url)] = {0};
+  char portal_info[sizeof(probe_info)] = {0};
+  char failed_info[sizeof(probe_info)] = {0};
+  bool portal_seen = false;
 
-  char location[sizeof(portal_url)] = {0};
-  esp_http_client_config_t config = {};
-  config.url = CONNECTIVITY_CHECK_URL;
-  config.timeout_ms = 5000;
-  config.disable_auto_redirect = true;
-  config.event_handler = probe_http_event_handler;
-  config.user_data = location;
-  config.if_name = &ifr;
-
-  esp_http_client_handle_t client = esp_http_client_init(&config);
-  if (!client)
+  for (size_t i = 0; i < sizeof(CONNECTIVITY_PROBES) / sizeof(CONNECTIVITY_PROBES[0]); i++)
   {
-    ESP_LOGE(TAG_MAIN, "Failed to create HTTP client");
-    uplink_state = UPLINK_OFFLINE;
-    return;
+    probe_result_t result = run_connectivity_probe(&CONNECTIVITY_PROBES[i], location, info, sizeof(info));
+    ESP_LOGI(TAG_MAIN, "  %s", info);
+
+    if (result == PROBE_ONLINE)
+    {
+      ESP_LOGI(TAG_MAIN, "✓ Internet connectivity confirmed");
+      strlcpy(probe_info, info, sizeof(probe_info));
+      portal_url[0] = '\0';
+      uplink_state = UPLINK_ONLINE;
+      return;
+    }
+    if (result == PROBE_PORTAL && !portal_seen)
+    {
+      // Keep checking - a single blocked probe host is no portal
+      portal_seen = true;
+      strlcpy(portal_location, location, sizeof(portal_location));
+      strlcpy(portal_info, info, sizeof(portal_info));
+    }
+    else if (result == PROBE_FAILED && failed_info[0] == '\0')
+    {
+      strlcpy(failed_info, info, sizeof(failed_info));
+    }
   }
 
-  esp_err_t err = esp_http_client_perform(client);
-  int status = esp_http_client_get_status_code(client);
-  esp_http_client_cleanup(client);
+  if (!portal_seen)
+  {
+    portal_seen = detect_dns_hijack(portal_location, sizeof(portal_location), portal_info, sizeof(portal_info));
+    if (!portal_seen)
+    {
+      strlcpy(probe_info, failed_info, sizeof(probe_info));
+      strlcat(probe_info, "; ", sizeof(probe_info));
+      strlcat(probe_info, portal_info, sizeof(probe_info));
+      ESP_LOGW(TAG_MAIN, "✗ No internet connectivity (%s)", probe_info);
+      uplink_state = UPLINK_NO_INTERNET;
+      return;
+    }
+  }
 
-  if (err != ESP_OK)
-  {
-    ESP_LOGW(TAG_MAIN, "✗ No internet connectivity (%s)", esp_err_to_name(err));
-    uplink_state = UPLINK_OFFLINE;
-  }
-  else if (status == 204)
-  {
-    ESP_LOGI(TAG_MAIN, "✓ Internet connectivity confirmed");
-    uplink_state = UPLINK_ONLINE;
-    portal_url[0] = '\0';
-  }
-  else
-  {
-    strlcpy(portal_url, location, sizeof(portal_url));
-    ESP_LOGW(TAG_MAIN, "⚠ Captive portal detected (HTTP %d) - login at: %s",
-             status, strlen(portal_url) > 0 ? portal_url : PORTAL_FALLBACK_URL);
-    uplink_state = UPLINK_PORTAL;
-  }
+  strlcpy(portal_url, portal_location, sizeof(portal_url));
+  strlcpy(probe_info, portal_info, sizeof(probe_info));
+  ESP_LOGW(TAG_MAIN, "⚠ Captive portal detected (%s) - login at: %s",
+           probe_info, strlen(portal_url) > 0 ? portal_url : PORTAL_FALLBACK_URL);
+  uplink_state = UPLINK_PORTAL;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -2756,7 +3333,7 @@ static void status_task(void *pvParameters)
         ESP_LOGI(TAG_MAIN, "AP Clients: %d", ap_client_count);
         ESP_LOGI(TAG_MAIN, "NAT: %s", napt_enabled ? "✓ ACTIVE" : "✗ DISABLED");
         ESP_LOGI(TAG_MAIN, "Internet: %s",
-                 uplink_state == UPLINK_ONLINE ? "✓ ONLINE" : (uplink_state == UPLINK_PORTAL ? "⚠ CAPTIVE PORTAL" : "✗ OFFLINE"));
+                 uplink_state == UPLINK_ONLINE ? "✓ ONLINE" : (uplink_state == UPLINK_PORTAL ? "⚠ CAPTIVE PORTAL" : "✗ NO INTERNET"));
         if (stored_config.wg_enabled)
         {
           ESP_LOGI(TAG_MAIN, "WireGuard: %s",
@@ -2810,6 +3387,7 @@ extern "C" void app_main(void)
   stored_config.wg_port = WG_DEFAULT_PORT;
   stored_config.wg_keepalive = WG_DEFAULT_KEEPALIVE;
   stored_config.display_timeout = DEFAULT_DISPLAY_TIMEOUT;
+  stored_config.portal_redirect = true;
   ret = load_wifi_config(&stored_config);
   if (ret != ESP_OK)
   {
@@ -2828,6 +3406,7 @@ extern "C" void app_main(void)
     stored_config.wg_port = WG_DEFAULT_PORT;
     stored_config.wg_keepalive = WG_DEFAULT_KEEPALIVE;
     stored_config.display_timeout = DEFAULT_DISPLAY_TIMEOUT;
+  stored_config.portal_redirect = true;
     stored_config.configured = false;
     config_mode = true;
   }
@@ -2933,6 +3512,13 @@ extern "C" void app_main(void)
     /* Start WiFi */
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_LOGI(TAG_MAIN, "✓ WiFi started in AP+STA mode");
+
+    /* DNS proxy - lets clients open the uplink's captive portal login page */
+    if (stored_config.portal_redirect)
+    {
+      offer_dns_proxy();
+      xTaskCreate(dns_proxy_task, "dns_proxy", 4096, NULL, 5, NULL);
+    }
 
     /* Start web server right away - also reachable when the uplink fails,
      * so the uplink can be fixed via WiFi scan */
