@@ -159,6 +159,116 @@ static uint32_t reconnect_delay_ms = WIFI_RECONNECT_MIN_MS;
 static volatile bool scan_in_progress = false;
 static bool sta_open_fallback = false; // password saved, but the uplink turned out to be an open network
 
+/* Uplink diagnostics (debug page, display) */
+static uint8_t last_disconnect_reason = 0; // 0 = none yet
+static int64_t last_disconnect_us = 0;
+static uint32_t disconnect_count = 0;
+static int64_t connected_since_us = 0;
+
+/* Recent log output, kept for the debug page (also goes to the serial port) */
+#define DEBUG_LOG_SIZE 6144
+static char debug_log[DEBUG_LOG_SIZE];
+static size_t debug_log_head = 0; // next write position
+static bool debug_log_wrapped = false;
+static portMUX_TYPE debug_log_lock = portMUX_INITIALIZER_UNLOCKED;
+static vprintf_like_t serial_vprintf = NULL;
+
+static int debug_log_vprintf(const char *fmt, va_list args)
+{
+  char line[160];
+  va_list copy;
+  va_copy(copy, args);
+  int len = vsnprintf(line, sizeof(line), fmt, copy);
+  va_end(copy);
+  if (len > (int)sizeof(line) - 1)
+    len = sizeof(line) - 1;
+
+  if (len > 0)
+  {
+    taskENTER_CRITICAL(&debug_log_lock);
+    bool in_escape = false; // drop ANSI color codes
+    for (int i = 0; i < len; i++)
+    {
+      char c = line[i];
+      if (c == '\033')
+        in_escape = true;
+      if (in_escape)
+      {
+        if (c == 'm')
+          in_escape = false;
+        continue;
+      }
+      debug_log[debug_log_head++] = c;
+      if (debug_log_head == DEBUG_LOG_SIZE)
+      {
+        debug_log_head = 0;
+        debug_log_wrapped = true;
+      }
+    }
+    taskEXIT_CRITICAL(&debug_log_lock);
+  }
+  return serial_vprintf ? serial_vprintf(fmt, args) : vprintf(fmt, args);
+}
+
+/* Short explanation of a WiFi disconnect reason (fits the display) */
+static const char *disconnect_reason_text(uint8_t reason)
+{
+  switch (reason)
+  {
+  case 0:
+    return "connecting";
+  case WIFI_REASON_NO_AP_FOUND:
+    return "network not found";
+  case WIFI_REASON_AUTH_FAIL:
+  case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+  case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    return "wrong password?";
+  case WIFI_REASON_ASSOC_FAIL:
+  case WIFI_REASON_CONNECTION_FAIL:
+    return "AP refused connection";
+  case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    return "security not supported";
+  case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+    return "security below WPA2";
+  case WIFI_REASON_BEACON_TIMEOUT:
+    return "signal lost";
+  case WIFI_REASON_ASSOC_LEAVE:
+    return "disconnected";
+  default:
+    return "WiFi error";
+  }
+}
+
+static const char *authmode_name(wifi_auth_mode_t mode)
+{
+  switch (mode)
+  {
+  case WIFI_AUTH_OPEN:
+    return "open";
+  case WIFI_AUTH_WEP:
+    return "WEP";
+  case WIFI_AUTH_WPA_PSK:
+    return "WPA";
+  case WIFI_AUTH_WPA2_PSK:
+    return "WPA2";
+  case WIFI_AUTH_WPA_WPA2_PSK:
+    return "WPA/WPA2";
+  case WIFI_AUTH_WPA3_PSK:
+    return "WPA3";
+  case WIFI_AUTH_WPA2_WPA3_PSK:
+    return "WPA2/WPA3";
+  case WIFI_AUTH_OWE:
+    return "open (OWE)";
+  case WIFI_AUTH_ENTERPRISE:
+  case WIFI_AUTH_WPA3_ENTERPRISE:
+  case WIFI_AUTH_WPA2_WPA3_ENTERPRISE:
+  case WIFI_AUTH_WPA3_ENT_192:
+    return "enterprise (not supported)";
+  default:
+    return "other";
+  }
+}
+
 /* Network interface handles */
 static esp_netif_t *sta_netif = NULL;
 static esp_netif_t *ap_netif = NULL;
@@ -458,6 +568,7 @@ static const char *html_page_head =
     ".net{padding:8px;margin:0 0 4px;background:#e8f5e9;border-radius:4px;cursor:pointer;font-size:14px}"
     ".diag{font-size:12px;color:#666;word-break:break-all}"
     ".build{font-size:12px;color:#888;text-align:center;margin:20px auto}"
+    ".btn{background:#607d8b;color:#fff;padding:8px 14px;border-radius:4px;text-decoration:none;font-size:14px}"
     ".net:hover{background:#c8e6c9}"
     ".info{background:#e3f2fd;padding:10px;border-radius:4px;margin:10px 0;border-left:4px solid #2196F3}"
     ".section{margin:20px 0;padding:15px;background:#fafafa;border-radius:4px}"
@@ -574,6 +685,9 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
 
   httpd_resp_sendstr_chunk(req, html_page_head);
   send_status_html(req);
+  httpd_resp_sendstr_chunk(req, "<div class='status' style='display:flex;gap:8px;justify-content:center'>"
+                                "<a class='btn' href='/debug?check=1' target='_blank'>Debug info</a>"
+                                "<a class='btn' href='/debug?scan=1' target='_blank'>Debug + WiFi scan</a></div>");
   if (!config_mode && strlen(config->admin_password) == 0)
     httpd_resp_sendstr_chunk(req, "<div class='status err'>The web panel has no password yet - anyone on this "
                                   "network can change these settings. Set one under Device.</div>");
@@ -1232,6 +1346,7 @@ static esp_err_t apply_sta_config(bool open)
   wifi_sta_config.sta.failure_retry_cnt = WIFI_STA_DRIVER_RETRIES;
   wifi_sta_config.sta.threshold.authmode = use_password ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
   wifi_sta_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+  wifi_sta_config.sta.owe_enabled = !use_password; // "Enhanced Open" networks
   return esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config);
 }
 
@@ -1732,11 +1847,12 @@ static void send_json_string(httpd_req_t *req, const char *src)
 /**
  * WiFi scan handler - returns nearby networks as JSON
  */
-static esp_err_t scan_handler(httpd_req_t *req)
+/**
+ * Scan for networks. Returns the records (sorted by RSSI, free() them) or
+ * NULL with err set.
+ */
+static wifi_ap_record_t *scan_networks(uint16_t *count, esp_err_t *err_out)
 {
-  if (!check_auth(req))
-    return ESP_OK;
-
   wifi_scan_config_t scan_config = {};
   scan_config.show_hidden = false;
 
@@ -1760,25 +1876,41 @@ static esp_err_t scan_handler(httpd_req_t *req)
     schedule_reconnect();
   }
 
+  *err_out = err;
   if (err != ESP_OK)
   {
     // e.g. ESP_ERR_WIFI_STATE while the station is busy connecting
     ESP_LOGW(TAG_STA, "Scan failed: %s", esp_err_to_name(err));
-    httpd_resp_set_status(req, "503 Service Unavailable");
-    httpd_resp_sendstr(req, esp_err_to_name(err));
-    return ESP_OK;
+    return NULL;
   }
 
-  uint16_t count = WIFI_SCAN_MAX_APS;
+  *count = WIFI_SCAN_MAX_APS;
   wifi_ap_record_t *records = (wifi_ap_record_t *)calloc(WIFI_SCAN_MAX_APS, sizeof(wifi_ap_record_t));
   if (!records)
   {
     esp_wifi_clear_ap_list();
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
-    return ESP_FAIL;
+    *err_out = ESP_ERR_NO_MEM;
+    return NULL;
   }
-  esp_wifi_scan_get_ap_records(&count, records);
-  ESP_LOGI(TAG_STA, "Scan found %d networks", count);
+  esp_wifi_scan_get_ap_records(count, records);
+  ESP_LOGI(TAG_STA, "Scan found %d networks", *count);
+  return records;
+}
+
+static esp_err_t scan_handler(httpd_req_t *req)
+{
+  if (!check_auth(req))
+    return ESP_OK;
+
+  uint16_t count = 0;
+  esp_err_t err = ESP_OK;
+  wifi_ap_record_t *records = scan_networks(&count, &err);
+  if (!records)
+  {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_sendstr(req, esp_err_to_name(err));
+    return ESP_OK;
+  }
 
   // Records are sorted by RSSI; list each SSID once (strongest AP)
   httpd_resp_set_type(req, "application/json");
@@ -1801,7 +1933,7 @@ static esp_err_t scan_handler(httpd_req_t *req)
     send_json_string(req, ssid);
     snprintf(fields, sizeof(fields), ",\"rssi\":%d,\"ch\":%d,\"auth\":%s}",
              records[i].rssi, records[i].primary,
-             records[i].authmode == WIFI_AUTH_OPEN ? "false" : "true");
+             (records[i].authmode == WIFI_AUTH_OPEN || records[i].authmode == WIFI_AUTH_OWE) ? "false" : "true");
     httpd_resp_sendstr_chunk(req, fields);
     first = false;
   }
@@ -1809,6 +1941,153 @@ static esp_err_t scan_handler(httpd_req_t *req)
   httpd_resp_sendstr_chunk(req, NULL);
 
   free(records);
+  return ESP_OK;
+}
+
+/* printf into the response (chunked) */
+static void debug_printf(httpd_req_t *req, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void debug_printf(httpd_req_t *req, const char *fmt, ...)
+{
+  char line[192];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(line, sizeof(line), fmt, args);
+  va_end(args);
+  httpd_resp_sendstr_chunk(req, line);
+}
+
+static const char *uplink_state_name(uplink_state_t state)
+{
+  switch (state)
+  {
+  case UPLINK_CHECKING:
+    return "checking";
+  case UPLINK_PORTAL:
+    return "captive portal (login required)";
+  case UPLINK_NO_INTERNET:
+    return "connected, no internet";
+  case UPLINK_ONLINE:
+    return "online";
+  default:
+    return "offline (not connected)";
+  }
+}
+
+/**
+ * Debug page (plain text, easy to copy): uplink connection details, the
+ * last connectivity check, optionally a WiFi scan (?scan=1) and the recent
+ * log output. ?check=1 runs the connectivity check right away.
+ */
+static esp_err_t debug_handler(httpd_req_t *req)
+{
+  if (!check_auth(req))
+    return ESP_OK;
+
+  char query[32] = {0}, value[4] = {0};
+  httpd_req_get_url_query_str(req, query, sizeof(query));
+  bool scan = httpd_query_key_value(query, "scan", value, sizeof(value)) == ESP_OK;
+  if (httpd_query_key_value(query, "check", value, sizeof(value)) == ESP_OK && status_task_handle)
+    xTaskNotifyGive(status_task_handle);
+
+  httpd_resp_set_type(req, "text/plain; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  const esp_app_desc_t *app = esp_app_get_description();
+#ifdef FIRMWARE_VERSION
+  const char *version = FIRMWARE_VERSION;
+#else
+  const char *version = app->version;
+#endif
+  int64_t now = esp_timer_get_time();
+  debug_printf(req, "CardRepeater debug - build %s (%s %s, ESP-IDF %s)\n", version, app->date, app->time, app->idf_ver);
+  debug_printf(req, "Uptime: %llds, free heap: %lu bytes (min %lu)\n\n", (long long)(now / 1000000),
+               (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
+
+  /* Uplink connection */
+  debug_printf(req, "== Uplink WiFi ==\nSSID: \"%s\"\nSaved password: %s\n", stored_config.sta_ssid,
+               strlen(stored_config.sta_password) > 0 ? "yes" : "no (open network)");
+  debug_printf(req, "Connect mode: %s\n",
+               strlen(stored_config.sta_password) == 0 ? "open, any security"
+               : sta_open_fallback                    ? "without password (open network fallback)"
+                                                      : "with password, WPA2 or better");
+  debug_printf(req, "Connected: %s\n", sta_connected ? "yes" : "no");
+  if (sta_connected)
+    debug_printf(req, "Connected for: %llds\n", (long long)((now - connected_since_us) / 1000000));
+  debug_printf(req, "Disconnects: %lu", (unsigned long)disconnect_count);
+  if (disconnect_count > 0)
+    debug_printf(req, ", last: reason %u (%s) %llds ago", (unsigned)last_disconnect_reason,
+                 disconnect_reason_text(last_disconnect_reason), (long long)((now - last_disconnect_us) / 1000000));
+  httpd_resp_sendstr_chunk(req, "\n");
+
+  wifi_ap_record_t ap_info;
+  if (sta_connected && esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
+    debug_printf(req, "AP: " MACSTR ", channel %d, RSSI %d dBm, security %s\n", MAC2STR(ap_info.bssid),
+                 ap_info.primary, ap_info.rssi, authmode_name(ap_info.authmode));
+
+  esp_netif_ip_info_t ip;
+  if (sta_netif && esp_netif_get_ip_info(sta_netif, &ip) == ESP_OK)
+    debug_printf(req, "IP: " IPSTR "/" IPSTR ", gateway " IPSTR "\n", IP2STR(&ip.ip), IP2STR(&ip.netmask), IP2STR(&ip.gw));
+  esp_netif_dns_info_t dns = {};
+  if (sta_netif && esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK)
+    debug_printf(req, "DNS: " IPSTR "\n", IP2STR(&dns.ip.u_addr.ip4));
+
+  /* Internet */
+  debug_printf(req, "\n== Internet ==\nState: %s\n", uplink_state_name(uplink_state));
+  debug_printf(req, "Last check: %s\n", strlen(probe_info) > 0 ? probe_info : "-");
+  if (strlen(portal_url) > 0)
+    debug_printf(req, "Login page: %s\n", portal_url);
+  debug_printf(req, "Portal redirect for clients: %s\n", stored_config.portal_redirect ? "on" : "off");
+
+  /* Access point */
+  debug_printf(req, "\n== Access point ==\nSSID: \"%s\", address %s, channel %d, clients %d\n",
+               stored_config.ap_ssid, ap_ip_str, WIFI_AP_CHANNEL, ap_client_count);
+  if (stored_config.wg_enabled)
+    debug_printf(req, "WireGuard: %s\n", wg_is_default ? "routing" : (wg_peer_up ? "peer up" : "connecting"));
+
+  /* Scan */
+  if (scan)
+  {
+    httpd_resp_sendstr_chunk(req, "\n== WiFi scan (2.4 GHz only) ==\n");
+    uint16_t count = 0;
+    esp_err_t err = ESP_OK;
+    wifi_ap_record_t *records = scan_networks(&count, &err);
+    if (!records)
+    {
+      debug_printf(req, "Scan failed: %s\n", esp_err_to_name(err));
+    }
+    else
+    {
+      bool found = false;
+      for (int i = 0; i < count; i++)
+      {
+        bool match = strcmp((const char *)records[i].ssid, stored_config.sta_ssid) == 0;
+        found |= match;
+        debug_printf(req, "%s %-32s ch %2d %4d dBm  %s\n", match ? ">>" : "  ",
+                     records[i].ssid[0] ? (const char *)records[i].ssid : "(hidden)", records[i].primary,
+                     records[i].rssi, authmode_name(records[i].authmode));
+      }
+      if (!found)
+        debug_printf(req, "Uplink \"%s\" not found - check the name, the distance, or whether it is 5 GHz only\n",
+                     stored_config.sta_ssid);
+      free(records);
+    }
+  }
+
+  /* Recent log */
+  httpd_resp_sendstr_chunk(req, "\n== Log ==\n");
+  char *copy = (char *)malloc(DEBUG_LOG_SIZE);
+  if (copy)
+  {
+    taskENTER_CRITICAL(&debug_log_lock);
+    size_t len = debug_log_wrapped ? DEBUG_LOG_SIZE : debug_log_head;
+    size_t start = debug_log_wrapped ? debug_log_head : 0;
+    memcpy(copy, debug_log + start, len - start);
+    memcpy(copy + (len - start), debug_log, start);
+    taskEXIT_CRITICAL(&debug_log_lock);
+    httpd_resp_send_chunk(req, copy, len);
+    free(copy);
+  }
+  httpd_resp_sendstr_chunk(req, NULL);
   return ESP_OK;
 }
 
@@ -1865,6 +2144,13 @@ static httpd_handle_t start_webserver(void)
         .handler = scan_handler,
         .user_ctx = NULL};
     httpd_register_uri_handler(web_server, &scan);
+
+    httpd_uri_t debug = {
+        .uri = "/debug",
+        .method = HTTP_GET,
+        .handler = debug_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(web_server, &debug);
 
     httpd_uri_t portal = {
         .uri = "/portal",
@@ -2387,8 +2673,15 @@ static void draw_status_screen(void)
   }
   else
   {
-    // Disconnected state
-    lcd_draw_string(6, uplink_y + 14, "Searching...", TERM_GREEN_DIM, TERM_BG);
+    // Disconnected state - network name and why the last attempt failed
+    lcd_draw_string(6, uplink_y + 14, stored_config.sta_ssid, TERM_GREEN_DIM, TERM_BG);
+    char reason[32];
+    if (last_disconnect_reason == 0)
+      snprintf(reason, sizeof(reason), "Searching...");
+    else
+      snprintf(reason, sizeof(reason), "%s (%u)", disconnect_reason_text(last_disconnect_reason),
+               (unsigned)last_disconnect_reason);
+    lcd_draw_string(6, uplink_y + 27, reason, TERM_ACCENT, TERM_BG);
     draw_circle(228, uplink_y + 7, 5, RGB565(0, 0, 200)); // Red = Disconnected
   }
 
@@ -3243,7 +3536,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     bool was_connected = sta_connected;
     sta_connected = false;
     uplink_state = UPLINK_OFFLINE;
-    ESP_LOGW(TAG_STA, "Uplink disconnected (reason %d)", event->reason);
+    last_disconnect_reason = event->reason;
+    last_disconnect_us = esp_timer_get_time();
+    disconnect_count++;
+    ESP_LOGW(TAG_STA, "Uplink disconnected (reason %d: %s)", event->reason, disconnect_reason_text(event->reason));
 
     // No network with the expected security: with a saved password try the
     // network as an open one, and back (the network may change security)
@@ -3272,6 +3568,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     ESP_LOGI(TAG_STA, "✓ Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
     reconnect_delay_ms = WIFI_RECONNECT_MIN_MS;
+    connected_since_us = esp_timer_get_time();
     sta_connected = true;
     xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 
@@ -3395,6 +3692,9 @@ static void status_task(void *pvParameters)
  */
 extern "C" void app_main(void)
 {
+  /* Keep recent log output for the web panel's debug page */
+  serial_vprintf = esp_log_set_vprintf(debug_log_vprintf);
+
   ESP_LOGI(TAG_MAIN, "╔══════════════════════════════════════╗");
   ESP_LOGI(TAG_MAIN, "║   ESP32-S3 WiFi Repeater with NAT    ║");
   ESP_LOGI(TAG_MAIN, "╚══════════════════════════════════════╝");

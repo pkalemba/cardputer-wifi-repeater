@@ -52,6 +52,7 @@
 ### ⚙️ Web Configuration
 - **Easy Setup**: Web-UI based configuration interface (because I couldn't get the built in keyboard working)
 - **Password protected**: log in with any user name and the admin password set during setup
+- **Debug page**: the **Debug info** button shows the uplink connection details (last disconnect reason, security, IP, DNS), the last internet check and the recent log as plain text - easy to copy into a bug report. **Debug + WiFi scan** also lists the networks in range and whether the uplink is among them
 - **Build info**: the firmware version (`git describe`: release tag or commit) and build time are shown at the bottom of the page
 
 ## 🚀 Quick Start
@@ -137,6 +138,8 @@ Connect a phone or laptop to the repeater: it shows its "Sign in to network" not
 and opens the network's login page, just like on the network itself. You can also open
 `http://192.168.4.1` and follow the **Open the login page** link (or open any `http://` page).
 After logging in, the status changes to online within ~10 seconds and all clients share the access.
+
+While the uplink is not connected, the display shows why the last attempt failed (for example `network not found (201)` or `wrong password? (15)`).
 
 If the display shows `NO NET`, the repeater got no answer at all. Clients are sent to
 `http://192.168.4.1/portal`, which links to the uplink's gateway and to `neverssl.com` - many
