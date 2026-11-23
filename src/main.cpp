@@ -63,6 +63,7 @@
 // Display includes
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -332,6 +333,8 @@ static bool wg_initialized = false;
 static bool wg_connected = false;
 static bool wg_peer_up = false;
 static char wg_status[96] = "disabled";
+static volatile bool wg_toggle_requested = false; // V key, handled in the status task
+static bool wg_configured(void);
 static int64_t wg_connect_us = 0; // when the tunnel was started
 
 /* Copy of the peer state shown on the debug page */
@@ -366,6 +369,22 @@ static TaskHandle_t status_task_handle = NULL;
 #define LCD_H_RES 136
 #define LCD_V_RES 240
 #define LCD_PIXEL_CLK 40000000
+
+/* M5Stack Cardputer ADV keyboard: TCA8418 key matrix controller on I2C */
+#define KEYBOARD_SDA_PIN 8
+#define KEYBOARD_SCL_PIN 9
+#define TCA8418_ADDR 0x34
+#define TCA8418_REG_CFG 0x01
+#define TCA8418_REG_INT_STAT 0x02
+#define TCA8418_REG_KEY_LCK_EC 0x03
+#define TCA8418_REG_KEY_EVENT_A 0x04
+#define TCA8418_REG_KP_GPIO_1 0x1D
+#define TCA8418_REG_KP_GPIO_2 0x1E
+#define TCA8418_REG_KP_GPIO_3 0x1F
+#define TCA8418_KEY_PRESSED 0x80
+/* Key numbers are row * 10 + column + 1 of the 7x8 matrix (layout as in the
+ * M5Cardputer library): V is in the bottom row, 7th key -> matrix row 3, column 3 */
+#define KEY_V 34
 
 /* M5Stack Cardputer G0 button and battery */
 #define BUTTON_G0_PIN 0            // active low; also a strapping pin (download mode at reset)
@@ -2804,6 +2823,10 @@ static void draw_status_screen(void)
       const char *vpn_str = wg_is_default ? "VPN:ON" : (wg_peer_up ? "VPN:RDY" : "VPN:..");
       lcd_draw_string(176, uplink_y + 27, vpn_str, wg_is_default ? TERM_GREEN : TERM_GREEN_DIM, TERM_BG);
     }
+    else if (wg_configured())
+    {
+      lcd_draw_string(168, uplink_y + 27, "VPN:OFF", TERM_GREEN_DIM, TERM_BG); // V switches it on
+    }
   }
   else
   {
@@ -2965,6 +2988,100 @@ static void factory_reset(void)
  * UI task: G0 button, screen timeout and battery measurement.
  * A short press on G0 wakes the screen, holding it for 5 s erases all settings.
  */
+/* ═══════════════════════════════════════════════════════════════════
+ * KEYBOARD (Cardputer ADV)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static i2c_master_dev_handle_t keyboard_dev = NULL;
+
+static esp_err_t tca8418_write(uint8_t reg, uint8_t value)
+{
+  uint8_t buf[2] = {reg, value};
+  return i2c_master_transmit(keyboard_dev, buf, sizeof(buf), 50);
+}
+
+static esp_err_t tca8418_read(uint8_t reg, uint8_t *value)
+{
+  return i2c_master_transmit_receive(keyboard_dev, &reg, 1, value, 1, 50);
+}
+
+/**
+ * Set up the TCA8418 as a 7x8 key matrix (like the M5Cardputer library).
+ * Key events are polled, the interrupt pin is not used.
+ */
+static bool keyboard_init(void)
+{
+  i2c_master_bus_config_t bus_config = {};
+  bus_config.i2c_port = -1; // any free controller
+  bus_config.sda_io_num = (gpio_num_t)KEYBOARD_SDA_PIN;
+  bus_config.scl_io_num = (gpio_num_t)KEYBOARD_SCL_PIN;
+  bus_config.clk_source = I2C_CLK_SRC_DEFAULT;
+  bus_config.glitch_ignore_cnt = 7;
+  bus_config.flags.enable_internal_pullup = true;
+
+  i2c_master_bus_handle_t bus = NULL;
+  if (i2c_new_master_bus(&bus_config, &bus) != ESP_OK)
+    return false;
+  if (i2c_master_probe(bus, TCA8418_ADDR, 50) != ESP_OK)
+  {
+    ESP_LOGW(TAG_MAIN, "Keyboard: no TCA8418 found (not a Cardputer ADV?) - V key disabled");
+    i2c_del_master_bus(bus);
+    return false;
+  }
+
+  i2c_device_config_t dev_config = {};
+  dev_config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+  dev_config.device_address = TCA8418_ADDR;
+  dev_config.scl_speed_hz = 400000;
+  if (i2c_master_bus_add_device(bus, &dev_config, &keyboard_dev) != ESP_OK)
+    return false;
+
+  tca8418_write(TCA8418_REG_KP_GPIO_1, 0x7F); // rows 0-6
+  tca8418_write(TCA8418_REG_KP_GPIO_2, 0xFF); // columns 0-7
+  tca8418_write(TCA8418_REG_KP_GPIO_3, 0x00);
+  tca8418_write(TCA8418_REG_CFG, 0x01);       // key event interrupt (KE_IEN)
+
+  // Drop events from before the start
+  uint8_t event = 0;
+  for (int i = 0; i < 10 && tca8418_read(TCA8418_REG_KEY_EVENT_A, &event) == ESP_OK && event != 0; i++)
+  {
+  }
+  tca8418_write(TCA8418_REG_INT_STAT, 0x03);
+  ESP_LOGI(TAG_MAIN, "✓ Keyboard ready (V toggles the VPN)");
+  return true;
+}
+
+/**
+ * Next key press from the keyboard FIFO (key number), 0 when none
+ */
+static uint8_t keyboard_read_press(void)
+{
+  if (!keyboard_dev)
+    return 0;
+  uint8_t count = 0;
+  if (tca8418_read(TCA8418_REG_KEY_LCK_EC, &count) != ESP_OK || (count & 0x0F) == 0)
+    return 0;
+
+  uint8_t pressed = 0;
+  for (int i = 0; i < (count & 0x0F); i++)
+  {
+    uint8_t event = 0;
+    if (tca8418_read(TCA8418_REG_KEY_EVENT_A, &event) != ESP_OK || event == 0)
+      break;
+    if ((event & TCA8418_KEY_PRESSED) && pressed == 0)
+      pressed = event & 0x7F;
+  }
+  tca8418_write(TCA8418_REG_INT_STAT, 0x01);
+  return pressed;
+}
+
+static bool wg_configured(void)
+{
+  return strlen(stored_config.wg_private_key) == WG_KEY_B64_LEN &&
+         strlen(stored_config.wg_peer_public_key) == WG_KEY_B64_LEN &&
+         strlen(stored_config.wg_endpoint) > 0 && strlen(stored_config.wg_address) > 0;
+}
+
 static void ui_task(void *pvParameters)
 {
   gpio_config_t button_config = {};
@@ -2978,6 +3095,8 @@ static void ui_task(void *pvParameters)
   int countdown_shown = -1;
   TickType_t last_battery_tick = xTaskGetTickCount();
   last_activity_tick = xTaskGetTickCount();
+  if (!config_mode)
+    keyboard_init();
 
   while (1)
   {
@@ -3016,6 +3135,20 @@ static void ui_task(void *pvParameters)
       display_wake();
     }
     was_pressed = pressed;
+
+    // V: switch the VPN on/off (done in the status task, next to the tunnel updates)
+    uint8_t key = keyboard_read_press();
+    if (key == KEY_V && status_task_handle)
+    {
+      wg_toggle_requested = true;
+      xTaskNotifyGive(status_task_handle);
+      display_wake();
+    }
+    else if (key != 0)
+    {
+      ESP_LOGD(TAG_MAIN, "Key %u pressed", key);
+      display_wake();
+    }
 
     // Screen timeout (the screen stays on in setup mode)
     if (!config_mode && stored_config.display_timeout > 0 && !pressed)
@@ -3815,6 +3948,52 @@ static void wifi_init_sta(void)
 }
 
 /**
+ * Stop the tunnel: clients go directly through the uplink again
+ */
+static void wireguard_stop(void)
+{
+  if (wg_connected && wg_ctx.netif)
+    esp_netif_tcpip_exec(wg_disconnect_cb, &wg_ctx); // also restores the default route
+  wg_connected = false;
+  wg_peer_up = false;
+  wg_is_default = false;
+}
+
+/**
+ * V key: switch the VPN on or off and remember it (same setting as the
+ * checkbox in the web panel)
+ */
+static void wireguard_toggle(void)
+{
+  bool enable = !stored_config.wg_enabled;
+  if (enable && !wg_configured())
+  {
+    ESP_LOGW(TAG_MAIN, "VPN: not configured - set up WireGuard in the web panel first");
+    strlcpy(wg_status, "not configured", sizeof(wg_status));
+    return;
+  }
+
+  stored_config.wg_enabled = enable;
+  if (!enable)
+  {
+    wireguard_stop();
+    strlcpy(wg_status, "switched off (V key)", sizeof(wg_status));
+  }
+  ESP_LOGI(TAG_MAIN, "VPN %s (V key)", enable ? "ON" : "OFF");
+
+  nvs_handle_t nvs;
+  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK)
+  {
+    nvs_set_u8(nvs, NVS_KEY_WG_ENABLED, enable ? 1 : 0);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+  }
+
+  if (sta_connected)
+    setup_dns_forwarding(); // VPN DNS for clients when portal redirect is off
+}
+
+/**
  * Status monitoring task - connectivity / captive portal checks and WireGuard
  */
 static void status_task(void *pvParameters)
@@ -3822,6 +4001,12 @@ static void status_task(void *pvParameters)
   while (1)
   {
     uplink_state_t previous_state = uplink_state;
+
+    if (wg_toggle_requested)
+    {
+      wg_toggle_requested = false;
+      wireguard_toggle();
+    }
 
     if (sta_connected)
     {

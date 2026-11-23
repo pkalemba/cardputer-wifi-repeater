@@ -124,6 +124,14 @@ After configuration:
 > Configs saved by older firmware have no admin password: the panel stays open and shows a
 > warning until you set one.
 
+### Keyboard (Cardputer ADV)
+
+- **V**: switches the WireGuard VPN on or off (remembered across restarts, same as the
+  checkbox in the web UI). The display shows `VPN:OFF` while it is configured but off.
+  WireGuard has to be set up in the web UI first.
+
+The original Cardputer's keyboard (GPIO matrix) is not supported yet.
+
 ### G0 Button
 
 - **Press**: turns the screen on
