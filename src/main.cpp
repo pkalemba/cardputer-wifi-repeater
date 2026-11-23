@@ -2031,8 +2031,11 @@ static void send_wireguard_debug(httpd_req_t *req, int64_t now_us)
 
   char a[24], b[24];
   debug_printf(req, "Resolved endpoint: %s:%u\n", ipaddr_ntoa_r(&snap.endpoint_ip, a, sizeof(a)), (unsigned)snap.endpoint_port);
-  if (!ip_addr_isany(&snap.seen_ip))
+  // The library sets the peer address to the endpoint already when connecting
+  if (snap.last_rx != 0 || snap.latest_handshake != 0)
     debug_printf(req, "Answers from: %s:%u\n", ipaddr_ntoa_r(&snap.seen_ip, b, sizeof(b)), (unsigned)snap.seen_port);
+  else
+    httpd_resp_sendstr_chunk(req, "Answers from: none yet\n");
   debug_printf(req, "Last handshake: %s\n", wg_age(a, sizeof(a), snap.now, snap.latest_handshake));
   debug_printf(req, "Last handshake attempt sent: %s\n", wg_age(a, sizeof(a), snap.now, snap.last_initiation_tx));
   debug_printf(req, "Last packet received: %s, sent: %s\n", wg_age(a, sizeof(a), snap.now, snap.last_rx),
