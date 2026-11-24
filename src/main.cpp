@@ -109,6 +109,8 @@
 #define NVS_KEY_ECO_MODE "eco"
 #define NVS_KEY_WG_KILL_SWITCH "wg_kill"
 #define NVS_KEY_MAC_MODE "mac_mode"
+#define NVS_KEY_WG_MODE "wg_mode"
+#define NVS_KEY_WG_SPLIT "wg_split"
 #define NVS_KEY_STA_MAC "sta_mac"
 
 /* WireGuard defaults */
@@ -144,6 +146,8 @@ typedef struct
   uint16_t wg_keepalive;
   char wg_dns[16]; // DNS offered to AP clients when VPN is enabled (empty = upstream)
   bool wg_kill_switch; // block client traffic while the tunnel is down
+  uint8_t wg_mode;     // WG_FULL_TUNNEL or WG_SPLIT_TUNNEL
+  char wg_split[160];  // split tunnel networks, e.g. "192.168.1.0/24, 10.0.0.0/8"
 
   /* Device */
   char admin_password[64];  // web panel login (empty only in configs from older firmware)
@@ -154,6 +158,11 @@ typedef struct
 } repeater_config_t;
 
 static repeater_config_t stored_config = {0};
+
+/* WireGuard modes */
+#define WG_FULL_TUNNEL 0  // all client traffic through the VPN
+#define WG_SPLIT_TUNNEL 1 // only the listed networks
+#define WG_SPLIT_MAX 8    // CONFIG_WIREGUARD_MAX_SRC_IPS (platformio.ini) leaves room for these
 
 /* Uplink MAC address modes */
 #define MAC_FACTORY 0
@@ -404,9 +413,85 @@ typedef struct
 static esp_err_t wg_snapshot_cb(void *arg); // runs in the TCP/IP task
 static volatile bool wg_is_default = false; // also read in the TCP/IP task (MSS clamping)
 
+/*
+ * Split tunnel routing. ESP-IDF routes with ip4_route_src_hook(); the link
+ * step wraps it (-Wl,--wrap=ip4_route_src_hook in platformio.ini), so the
+ * listed networks go to the tunnel - before NAPT, which then uses the
+ * tunnel address like in full tunnel mode.
+ */
+static uint32_t split_net[WG_SPLIT_MAX];  // network byte order
+static uint32_t split_mask[WG_SPLIT_MAX];
+static int split_count = 0;
+static struct netif *volatile split_route_netif = NULL; // set while the tunnel interface exists
+static volatile uint32_t split_routed_packets = 0;
+
+/**
+ * Parse "a.b.c.d/nn, a.b.c.d/nn ..." into split_net/split_mask style
+ * arrays. Returns the number of networks or -1 on a bad entry / too many.
+ */
+static bool parse_cidr(const char *cidr, char *ip_out, size_t ip_len, char *mask_out, size_t mask_len);
+
+static int parse_split_networks(const char *list, uint32_t *nets, uint32_t *masks)
+{
+  int count = 0;
+  const char *p = list;
+  while (*p)
+  {
+    while (*p == ' ' || *p == ',' || *p == ';')
+      p++;
+    if (!*p)
+      break;
+    char entry[24];
+    size_t len = strcspn(p, " ,;");
+    if (len >= sizeof(entry) || count >= WG_SPLIT_MAX)
+      return -1;
+    memcpy(entry, p, len);
+    entry[len] = '\0';
+    p += len;
+
+    char ip[16], mask[16];
+    if (!parse_cidr(entry, ip, sizeof(ip), mask, sizeof(mask)))
+      return -1;
+    uint32_t m = ipaddr_addr(mask);
+    nets[count] = ipaddr_addr(ip) & m;
+    masks[count] = m;
+    count++;
+  }
+  return count;
+}
+
+static bool in_split_networks(uint32_t addr)
+{
+  for (int i = 0; i < split_count; i++)
+    if ((addr & split_mask[i]) == split_net[i])
+      return true;
+  return false;
+}
+
+extern "C" struct netif *__real_ip4_route_src_hook(const ip4_addr_t *src, const ip4_addr_t *dest);
+extern "C" struct netif *__wrap_ip4_route_src_hook(const ip4_addr_t *src, const ip4_addr_t *dest)
+{
+  struct netif *tunnel = split_route_netif;
+  if (tunnel && dest && in_split_networks(ip4_addr_get_u32(dest)))
+  {
+    // Networks of this device (AP, uplink) stay local even when listed
+    struct netif *netif;
+    NETIF_FOREACH(netif)
+    {
+      if (netif != tunnel && netif_is_up(netif) && !ip4_addr_isany_val(*netif_ip4_addr(netif)) &&
+          ip4_addr_net_eq(dest, netif_ip4_addr(netif), netif_ip4_netmask(netif)))
+        return __real_ip4_route_src_hook(src, dest);
+    }
+    split_routed_packets = split_routed_packets + 1;
+    return tunnel;
+  }
+  return __real_ip4_route_src_hook(src, dest);
+}
+
 static bool kill_switch_active(void)
 {
-  return stored_config.wg_enabled && stored_config.wg_kill_switch && !wg_is_default &&
+  return stored_config.wg_enabled && stored_config.wg_kill_switch && stored_config.wg_mode == WG_FULL_TUNNEL &&
+         !wg_is_default &&
          uplink_state != UPLINK_PORTAL && uplink_state != UPLINK_NO_INTERNET;
 }
 
@@ -743,7 +828,12 @@ static void send_status_html(httpd_req_t *req)
 
   if (stored_config.wg_enabled)
   {
-    if (wg_is_default)
+    if (stored_config.wg_mode == WG_SPLIT_TUNNEL && wg_peer_up)
+    {
+      httpd_resp_sendstr_chunk(req, "<br>WireGuard: split tunnel up - VPN for ");
+      send_html_escaped(req, stored_config.wg_split);
+    }
+    else if (wg_is_default)
       httpd_resp_sendstr_chunk(req, "<br>WireGuard: tunnel up, all client traffic is routed through VPN");
     else if (wg_peer_up)
       httpd_resp_sendstr_chunk(req, "<br>WireGuard: handshake OK, waiting for uplink");
@@ -915,12 +1005,26 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
   send_html_escaped(req, config->wg_dns);
   httpd_resp_sendstr_chunk(req,
                            "' placeholder='e.g. 1.1.1.1 (empty = uplink DNS)'>"
+                           "<label>Mode:</label><select name='wg_mode'>");
+  httpd_resp_sendstr_chunk(req, config->wg_mode == WG_SPLIT_TUNNEL
+                                    ? "<option value='0'>Full tunnel - all client traffic</option>"
+                                      "<option value='1' selected>Split tunnel - only the networks below</option>"
+                                    : "<option value='0' selected>Full tunnel - all client traffic</option>"
+                                      "<option value='1'>Split tunnel - only the networks below</option>");
+  httpd_resp_sendstr_chunk(req, "</select><label>Split tunnel networks (up to 8):</label>"
+                                "<input type='text' name='wg_split' maxlength='159' value='");
+  send_html_escaped(req, config->wg_split);
+  httpd_resp_sendstr_chunk(req,
+                           "' placeholder='e.g. 192.168.1.0/24, 10.0.0.0/8'>"
                            "<label><input type='checkbox' name='wg_kill' value='1'");
   if (config->wg_kill_switch)
     httpd_resp_sendstr_chunk(req, " checked");
   httpd_resp_sendstr_chunk(req,
-                           ">Block client traffic while the VPN is down (kill switch)</label>"
-                           "<div class='info'>The tunnel uses AllowedIPs 0.0.0.0/0. Traffic switches to the VPN "
+                           ">Block client traffic while the VPN is down (kill switch, full tunnel)</label>"
+                           "<div class='info'>Split tunnel: only the listed networks (e.g. your home LAN) go through "
+                           "the VPN, everything else directly through the uplink; the networks of the repeater "
+                           "itself always stay local. The VPN DNS is used once the tunnel is up. "
+                           "Full tunnel uses AllowedIPs 0.0.0.0/0. Traffic switches to the VPN "
                            "after a successful handshake and while the uplink has internet access. "
                            "During captive portal login clients always reach the network directly - "
                            "with the kill switch, at all other times only through the VPN.</div>"
@@ -1419,6 +1523,8 @@ static esp_err_t save_wifi_config(const repeater_config_t *config)
   nvs_set_u16(nvs_handle, NVS_KEY_WG_KEEPALIVE, config->wg_keepalive);
   nvs_set_str(nvs_handle, NVS_KEY_WG_DNS, config->wg_dns);
   nvs_set_u8(nvs_handle, NVS_KEY_WG_KILL_SWITCH, config->wg_kill_switch ? 1 : 0);
+  nvs_set_u8(nvs_handle, NVS_KEY_WG_MODE, config->wg_mode);
+  nvs_set_str(nvs_handle, NVS_KEY_WG_SPLIT, config->wg_split);
   nvs_set_u8(nvs_handle, NVS_KEY_MAC_MODE, config->sta_mac_mode);
   nvs_set_blob(nvs_handle, NVS_KEY_STA_MAC, config->sta_mac, sizeof(config->sta_mac));
 
@@ -1515,6 +1621,9 @@ static esp_err_t load_wifi_config(repeater_config_t *config)
   uint8_t kill_switch = 0;
   nvs_get_u8(nvs_handle, NVS_KEY_WG_KILL_SWITCH, &kill_switch);
   config->wg_kill_switch = (kill_switch == 1);
+  nvs_get_u8(nvs_handle, NVS_KEY_WG_MODE, &config->wg_mode); // absent: full tunnel
+  len = sizeof(config->wg_split);
+  nvs_get_str(nvs_handle, NVS_KEY_WG_SPLIT, config->wg_split, &len);
 
   // Uplink MAC address (absent in configs saved by older firmware: factory address)
   nvs_get_u8(nvs_handle, NVS_KEY_MAC_MODE, &config->sta_mac_mode);
@@ -2022,6 +2131,10 @@ static esp_err_t save_handler(httpd_req_t *req)
   parse_query_param(body, "wg_host", new_config.wg_endpoint, sizeof(new_config.wg_endpoint));
   parse_query_param(body, "wg_dns", new_config.wg_dns, sizeof(new_config.wg_dns));
   new_config.wg_kill_switch = parse_query_param(body, "wg_kill", temp, sizeof(temp));
+  memset(temp, 0, sizeof(temp));
+  if (parse_query_param(body, "wg_mode", temp, sizeof(temp)))
+    new_config.wg_mode = atoi(temp) == WG_SPLIT_TUNNEL ? WG_SPLIT_TUNNEL : WG_FULL_TUNNEL;
+  parse_query_param(body, "wg_split", new_config.wg_split, sizeof(new_config.wg_split));
 
   // Keys are read in full so that a too long key is rejected instead of truncated
   memset(temp, 0, sizeof(temp));
@@ -2112,6 +2225,15 @@ static esp_err_t save_handler(httpd_req_t *req)
       error = "WireGuard endpoint is required";
     else if (strlen(new_config.wg_dns) > 0 && !ip4addr_aton(new_config.wg_dns, &dns))
       error = "DNS must be an IPv4 address";
+    else if (new_config.wg_mode == WG_SPLIT_TUNNEL)
+    {
+      uint32_t nets[WG_SPLIT_MAX], masks[WG_SPLIT_MAX];
+      int count = parse_split_networks(new_config.wg_split, nets, masks);
+      if (count < 0)
+        error = "Split tunnel networks: up to 8 entries like 192.168.1.0/24, separated by commas";
+      else if (count == 0)
+        error = "Split tunnel needs at least one network, e.g. 192.168.1.0/24";
+    }
   }
 
   if (error)
@@ -2328,6 +2450,12 @@ static void send_wireguard_debug(httpd_req_t *req, int64_t now_us)
                stored_config.wg_endpoint, (unsigned)stored_config.wg_port, stored_config.wg_address,
                (unsigned)stored_config.wg_keepalive);
   debug_printf(req, "Stage: %s\n", wg_status);
+  if (stored_config.wg_mode == WG_SPLIT_TUNNEL)
+    debug_printf(req, "Mode: split tunnel for %s (%d networks), %lu packets routed to the tunnel%s\n",
+                 stored_config.wg_split, split_count, (unsigned long)split_routed_packets,
+                 split_route_netif ? "" : " - routing not active yet");
+  else
+    httpd_resp_sendstr_chunk(req, "Mode: full tunnel\n");
   debug_printf(req, "Kill switch: %s, %lu packets blocked\n",
                !stored_config.wg_kill_switch ? "off" : kill_switch_active() ? "BLOCKING client traffic" : "on (not blocking)",
                (unsigned long)kill_switch_drops);
@@ -2749,7 +2877,8 @@ static bool is_portal_probe_host(const char *name)
  */
 static bool dns_upstream_server(ip4_addr_t *server)
 {
-  if (stored_config.wg_enabled && wg_is_default && strlen(stored_config.wg_dns) > 0 &&
+  bool tunnel_up = wg_is_default || (stored_config.wg_mode == WG_SPLIT_TUNNEL && wg_peer_up);
+  if (stored_config.wg_enabled && tunnel_up && strlen(stored_config.wg_dns) > 0 &&
       ip4addr_aton(stored_config.wg_dns, server))
     return true;
   if (!sta_connected)
@@ -3084,8 +3213,13 @@ static void draw_status_screen(void)
     // WireGuard tunnel status
     if (stored_config.wg_enabled)
     {
-      const char *vpn_str = wg_is_default ? "VPN:ON" : kill_switch_active() ? "VPN:BLK" : (wg_peer_up ? "VPN:RDY" : "VPN:..");
-      lcd_draw_string(176, uplink_y + 27, vpn_str, wg_is_default ? TERM_GREEN : TERM_GREEN_DIM, TERM_BG);
+      bool split_up = stored_config.wg_mode == WG_SPLIT_TUNNEL && wg_peer_up;
+      const char *vpn_str = split_up         ? "VPN:SPL"
+                            : wg_is_default  ? "VPN:ON"
+                            : kill_switch_active() ? "VPN:BLK"
+                            : (wg_peer_up ? "VPN:RDY" : "VPN:..");
+      lcd_draw_string(232 - (int)strlen(vpn_str) * 8, uplink_y + 27, vpn_str,
+                      (wg_is_default || split_up) ? TERM_GREEN : TERM_GREEN_DIM, TERM_BG);
     }
     else if (wg_configured())
     {
@@ -3796,7 +3930,29 @@ static esp_err_t wg_restore_default_cb(void *ctx) { return esp_wireguard_restore
 static esp_err_t wg_allow_all_cb(void *ctx)
 {
   // Full tunnel: accept and route any address through the peer
-  return esp_wireguard_add_allowed_ip((wireguard_ctx_t *)ctx, "0.0.0.0", "0.0.0.0");
+  if (stored_config.wg_mode == WG_FULL_TUNNEL)
+    return esp_wireguard_add_allowed_ip((wireguard_ctx_t *)ctx, "0.0.0.0", "0.0.0.0");
+
+  // Split tunnel: only the listed networks
+  for (int i = 0; i < split_count; i++)
+  {
+    char net[16], mask[16];
+    ip4_addr_t a, m;
+    a.addr = split_net[i];
+    m.addr = split_mask[i];
+    ip4addr_ntoa_r(&a, net, sizeof(net));
+    ip4addr_ntoa_r(&m, mask, sizeof(mask));
+    esp_err_t err = esp_wireguard_add_allowed_ip((wireguard_ctx_t *)ctx, net, mask);
+    if (err != ESP_OK)
+      return err;
+  }
+  return ESP_OK;
+}
+
+static esp_err_t wg_split_route_on_cb(void *ctx)
+{
+  split_route_netif = wg_ctx.netif;
+  return ESP_OK;
 }
 
 /*
@@ -3888,7 +4044,14 @@ static err_t wg_output_clamped(struct netif *netif, struct pbuf *p, const ip4_ad
 /* Tunnel -> clients: SYN-ACK of the servers (the AP interface sees all client traffic) */
 static err_t ap_output_clamped(struct netif *netif, struct pbuf *p, const ip4_addr_t *addr)
 {
-  if (wg_is_default)
+  bool from_tunnel = wg_is_default;
+  if (!from_tunnel && split_route_netif && p->len >= 20)
+  {
+    uint32_t src;
+    memcpy(&src, (const uint8_t *)p->payload + 12, 4);
+    from_tunnel = in_split_networks(src);
+  }
+  if (from_tunnel)
     clamp_tcp_mss((uint8_t *)p->payload, p->len, tunnel_mss);
   return ap_output_orig(netif, p, addr);
 }
@@ -4059,7 +4222,12 @@ static void wireguard_update(void)
       err = esp_netif_tcpip_exec(wg_allow_all_cb, &wg_ctx);
       if (err != ESP_OK)
       {
-        ESP_LOGE(TAG_MAIN, "WireGuard: failed to allow 0.0.0.0/0: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG_MAIN, "WireGuard: failed to set the allowed networks: %s", esp_err_to_name(err));
+      }
+      if (stored_config.wg_mode == WG_SPLIT_TUNNEL)
+      {
+        esp_netif_tcpip_exec(wg_split_route_on_cb, NULL); // listed networks go to the tunnel from now on
+        ESP_LOGI(TAG_MAIN, "WireGuard: split tunnel for %s", stored_config.wg_split);
       }
       if (esp_netif_tcpip_exec(wg_install_mss_clamping_cb, NULL) == ESP_OK)
       {
@@ -4093,7 +4261,7 @@ static void wireguard_update(void)
   // so compare with the actual lwIP default instead of a remembered flag
   wg_is_default = wg_ctx.netif != NULL && netif_default == wg_ctx.netif;
 
-  bool want_default = wg_peer_up && uplink_state == UPLINK_ONLINE;
+  bool want_default = stored_config.wg_mode == WG_FULL_TUNNEL && wg_peer_up && uplink_state == UPLINK_ONLINE;
   if (want_default && !wg_is_default)
   {
     if (esp_netif_tcpip_exec(wg_set_default_cb, &wg_ctx) == ESP_OK)
@@ -4110,7 +4278,9 @@ static void wireguard_update(void)
              wg_peer_up ? "uplink needs login" : "peer down");
   }
 
-  if (wg_peer_up)
+  if (wg_peer_up && stored_config.wg_mode == WG_SPLIT_TUNNEL)
+    strlcpy(wg_status, "tunnel up, routing the split networks", sizeof(wg_status));
+  else if (wg_peer_up)
     strlcpy(wg_status, wg_is_default ? "tunnel up, routing client traffic" : "peer up, waiting for internet on the uplink",
             sizeof(wg_status));
 }
@@ -4346,6 +4516,7 @@ static void wifi_init_sta(void)
  */
 static void wireguard_stop(void)
 {
+  split_route_netif = NULL; // before the interface goes away
   if (wg_connected && wg_ctx.netif)
     esp_netif_tcpip_exec(wg_disconnect_cb, &wg_ctx); // also restores the default route
   wg_connected = false;
@@ -4508,6 +4679,14 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG_MAIN, "  WireGuard: %s",
              stored_config.wg_enabled ? stored_config.wg_endpoint : "disabled");
     config_mode = false;
+  }
+
+  /* Split tunnel networks (validated when saved) */
+  if (stored_config.wg_mode == WG_SPLIT_TUNNEL)
+  {
+    split_count = parse_split_networks(stored_config.wg_split, split_net, split_mask);
+    if (split_count < 0)
+      split_count = 0;
   }
 
   /* CPU clock: eco mode scales between 80 and 160 MHz */

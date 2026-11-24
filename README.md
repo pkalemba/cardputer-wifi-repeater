@@ -25,7 +25,8 @@
 ### 🔐 WireGuard VPN
 - **Full tunnel**: all client traffic (`0.0.0.0/0`) is routed through a WireGuard peer
 - **Automatic time sync** (SNTP) before the handshake - required by WireGuard
-- **Kill switch** (optional): while the tunnel is down, client traffic is blocked instead of going out through the hotel network (DNS included). During captive portal login traffic is let through so the login page can be reached. The display shows `VPN:BLK`
+- **Full or split tunnel**: full tunnel sends all client traffic through the VPN; split tunnel only the listed networks (up to 8, e.g. `192.168.1.0/24, 10.0.0.0/8` for the home LAN) - everything else goes directly through the uplink. The display shows `VPN:SPL`
+- **Kill switch** (optional, full tunnel): while the tunnel is down, client traffic is blocked instead of going out through the hotel network (DNS included). During captive portal login traffic is let through so the login page can be reached. The display shows `VPN:BLK`
 - **Portal aware**: the tunnel takes over routing only once the uplink has real internet access, so hotel/airport login pages stay reachable
 - **Optional VPN DNS** offered to clients via DHCP
 
