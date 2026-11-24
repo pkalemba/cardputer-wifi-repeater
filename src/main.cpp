@@ -538,12 +538,34 @@ static bool config_mode = false;
 #define COLOR_DARKGREEN RGB565(0, 128, 0)
 #define COLOR_ORANGE RGB565(255, 165, 0)
 
-// Terminal Green Theme Colors (Classic CRT Green)
-#define TERM_BG RGB565(0, 0, 0)          // Pure black background
-#define TERM_GREEN RGB565(0, 255, 0)     // Bright pure green (classic terminal)
-#define TERM_GREEN_DIM RGB565(0, 180, 0) // Dimmed green
-#define TERM_GREEN_DARK RGB565(0, 60, 0) // Dark green for boxes
-#define TERM_ACCENT RGB565(50, 255, 50)  // Lighter accent green
+/* The panel is set up as BGR, so RGB565() takes the channels the other way
+ * round - DISPLAY_RGB() takes a normal R, G, B color */
+#define DISPLAY_RGB(r, g, b) RGB565(b, g, r)
+
+/* Gruvbox dark - the same palette as the web panel */
+#define GRUV_BG0 DISPLAY_RGB(0x28, 0x28, 0x28)
+#define GRUV_BG1 DISPLAY_RGB(0x3c, 0x38, 0x36)
+#define GRUV_BG2 DISPLAY_RGB(0x50, 0x49, 0x45)
+#define GRUV_BG3 DISPLAY_RGB(0x66, 0x5c, 0x54)
+#define GRUV_FG DISPLAY_RGB(0xeb, 0xdb, 0xb2)
+#define GRUV_FG4 DISPLAY_RGB(0xa8, 0x99, 0x84)
+#define GRUV_YELLOW DISPLAY_RGB(0xfa, 0xbd, 0x2f)
+#define GRUV_GREEN DISPLAY_RGB(0xb8, 0xbb, 0x26)
+#define GRUV_ORANGE DISPLAY_RGB(0xfe, 0x80, 0x19)
+#define GRUV_RED DISPLAY_RGB(0xfb, 0x49, 0x34)
+#define GRUV_AQUA DISPLAY_RGB(0x8e, 0xc0, 0x7c)
+
+/* Display colors by role */
+#define THEME_BG GRUV_BG0      // background
+#define THEME_BAR GRUV_BG1     // title bars, selected menu row
+#define THEME_BORDER GRUV_BG3  // box borders
+#define THEME_TITLE GRUV_YELLOW // titles and labels
+#define THEME_TEXT GRUV_FG     // values (network names, ...)
+#define THEME_DIM GRUV_FG4     // secondary text
+#define THEME_OK GRUV_GREEN    // online, VPN up, signal, battery
+#define THEME_CHECKING GRUV_YELLOW
+#define THEME_PORTAL GRUV_ORANGE
+#define THEME_ERROR GRUV_RED
 
 // Simple 8x8 font bitmap (ASCII 32-127) - abbreviated for space
 static const uint8_t font8x8[96][8] = {
@@ -1265,15 +1287,15 @@ static void display_init(void)
   ESP_LOGI(TAG_MAIN, "Display ready: %dx%d, framebuffer: %p", LCD_V_RES, LCD_H_RES, framebuffer);
 
   // Draw initial splash screen
-  lcd_fill_screen(TERM_BG);
+  lcd_fill_screen(THEME_BG);
 
   // Header
-  lcd_fill_rect(0, 0, 240, 18, TERM_GREEN_DARK);
-  lcd_draw_string(50, 5, "WiFi REPEATER", TERM_GREEN, TERM_GREEN_DARK);
+  lcd_fill_rect(0, 0, 240, 18, THEME_BAR);
+  lcd_draw_string(50, 5, "WiFi REPEATER", THEME_TITLE, THEME_BAR);
 
   // Status message
-  lcd_draw_string(30, 50, "Initializing...", TERM_ACCENT, TERM_BG);
-  lcd_draw_string(30, 70, "Starting WiFi", TERM_GREEN_DIM, TERM_BG);
+  lcd_draw_string(30, 50, "Initializing...", THEME_TEXT, THEME_BG);
+  lcd_draw_string(30, 70, "Starting WiFi", THEME_DIM, THEME_BG);
 
   lcd_flush();
 
@@ -2834,14 +2856,14 @@ static void draw_signal_bars(int x, int y, int rssi)
   else if (rssi > -90)
     bars = 2;
 
-  uint16_t bar_color = TERM_GREEN; // Always bright green when active
+  uint16_t bar_color = THEME_OK;
 
   // Draw 4 bars with increasing height
   for (int i = 0; i < 4; i++)
   {
     int bar_height = 2 + (i * 2);                                 // Heights: 2, 4, 6, 8
     int bar_y = y + (8 - bar_height);                             // Align bottom
-    uint16_t color = (i < bars) ? bar_color : RGB565(20, 40, 20); // Dark green if not active
+    uint16_t color = (i < bars) ? bar_color : GRUV_BG2; // inactive bars
     lcd_fill_rect(x + (i * 4), bar_y, 3, bar_height, color);
   }
 }
@@ -2875,7 +2897,7 @@ static void draw_battery(int right_x, int y, uint16_t bg_color)
     return;
 
   int level = battery_percent();
-  uint16_t color = level <= 15 ? RGB565(0, 0, 200) : TERM_GREEN; // red when low
+  uint16_t color = level <= 15 ? THEME_ERROR : THEME_OK; // red when low
 
   // 18x9 outline with a 2x5 terminal on the right
   int x = right_x - 20;
@@ -2894,19 +2916,19 @@ static void draw_battery(int right_x, int y, uint16_t bg_color)
  */
 static void draw_setup_screen(void)
 {
-  lcd_fill_screen(TERM_BG);
-  lcd_fill_rect(0, 0, 240, 18, TERM_GREEN_DARK);
-  lcd_draw_string(40, 5, "SETUP MODE", TERM_GREEN, TERM_GREEN_DARK);
-  draw_battery(236, 4, TERM_GREEN_DARK);
+  lcd_fill_screen(THEME_BG);
+  lcd_fill_rect(0, 0, 240, 18, THEME_BAR);
+  lcd_draw_string(40, 5, "SETUP MODE", THEME_TITLE, THEME_BAR);
+  draw_battery(236, 4, THEME_BAR);
 
-  lcd_draw_string(5, 30, "WiFi:", TERM_GREEN_DIM, TERM_BG);
-  lcd_draw_string(5, 45, DEFAULT_CONFIG_AP_SSID, TERM_ACCENT, TERM_BG);
+  lcd_draw_string(5, 30, "WiFi:", THEME_DIM, THEME_BG);
+  lcd_draw_string(5, 45, DEFAULT_CONFIG_AP_SSID, THEME_TEXT, THEME_BG);
 
-  lcd_draw_string(5, 65, "Config IP:", TERM_GREEN_DIM, TERM_BG);
-  lcd_draw_string(5, 80, ap_ip_str, TERM_GREEN, TERM_BG);
+  lcd_draw_string(5, 65, "Config IP:", THEME_DIM, THEME_BG);
+  lcd_draw_string(5, 80, ap_ip_str, THEME_TITLE, THEME_BG);
 
-  lcd_draw_string(5, 100, "Open browser and", TERM_GREEN_DIM, TERM_BG);
-  lcd_draw_string(5, 113, "visit IP above", TERM_GREEN_DIM, TERM_BG);
+  lcd_draw_string(5, 100, "Open browser and", THEME_DIM, THEME_BG);
+  lcd_draw_string(5, 113, "visit IP above", THEME_DIM, THEME_BG);
 }
 
 /**
@@ -2915,14 +2937,14 @@ static void draw_setup_screen(void)
 static void draw_status_screen(void)
 {
   // Clear screen with pure black background (terminal style)
-  lcd_fill_screen(TERM_BG);
+  lcd_fill_screen(THEME_BG);
 
   // ═══════════════════════════════════════════════════════════
   // HEADER with Title - Terminal style
   // ═══════════════════════════════════════════════════════════
-  lcd_fill_rect(0, 0, 240, 16, TERM_GREEN_DARK);
-  lcd_draw_string(6, 4, "Card Wifi Repeater", TERM_GREEN, TERM_GREEN_DARK);
-  draw_battery(236, 3, TERM_GREEN_DARK);
+  lcd_fill_rect(0, 0, 240, 16, THEME_BAR);
+  lcd_draw_string(6, 4, "Card Wifi Repeater", THEME_TITLE, THEME_BAR);
+  draw_battery(236, 3, THEME_BAR);
 
   // ═══════════════════════════════════════════════════════════
   // UPLINK SECTION (Box 1)
@@ -2930,15 +2952,15 @@ static void draw_status_screen(void)
   int uplink_y = 18;
 
   // Draw uplink box background with green border
-  lcd_fill_rect(2, uplink_y, 236, 42, TERM_BG);
+  lcd_fill_rect(2, uplink_y, 236, 42, THEME_BG);
   // Green border
-  lcd_fill_rect(2, uplink_y, 236, 1, TERM_GREEN_DIM);      // Top
-  lcd_fill_rect(2, uplink_y + 41, 236, 1, TERM_GREEN_DIM); // Bottom
-  lcd_fill_rect(2, uplink_y, 1, 42, TERM_GREEN_DIM);       // Left
-  lcd_fill_rect(237, uplink_y, 1, 42, TERM_GREEN_DIM);     // Right
+  lcd_fill_rect(2, uplink_y, 236, 1, THEME_BORDER);      // Top
+  lcd_fill_rect(2, uplink_y + 41, 236, 1, THEME_BORDER); // Bottom
+  lcd_fill_rect(2, uplink_y, 1, 42, THEME_BORDER);       // Left
+  lcd_fill_rect(237, uplink_y, 1, 42, THEME_BORDER);     // Right
 
   // Uplink label
-  lcd_draw_string(6, uplink_y + 3, "UPLINK", TERM_GREEN, TERM_BG);
+  lcd_draw_string(6, uplink_y + 3, "UPLINK", THEME_TITLE, THEME_BG);
 
   if (sta_connected)
   {
@@ -2946,7 +2968,7 @@ static void draw_status_screen(void)
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
     {
       // WiFi name in bright green
-      lcd_draw_string(6, uplink_y + 14, network_ssid(active_network), TERM_ACCENT, TERM_BG);
+      lcd_draw_string(6, uplink_y + 14, network_ssid(active_network), THEME_TEXT, THEME_BG);
 
       // Signal strength bars
       draw_signal_bars(6, uplink_y + 27, ap_info.rssi);
@@ -2954,33 +2976,33 @@ static void draw_status_screen(void)
       // RSSI value
       char rssi_str[16];
       snprintf(rssi_str, sizeof(rssi_str), "%ddBm", ap_info.rssi);
-      lcd_draw_string(26, uplink_y + 27, rssi_str, TERM_GREEN_DIM, TERM_BG);
+      lcd_draw_string(26, uplink_y + 27, rssi_str, THEME_DIM, THEME_BG);
     }
 
     // Internet status indicator (circle) - Green when internet is actually working
     if (uplink_state == UPLINK_ONLINE)
     {
-      lcd_draw_string(200, uplink_y + 3, "NET", TERM_GREEN_DIM, TERM_BG);
-      draw_circle(228, uplink_y + 7, 5, TERM_GREEN); // Bright green = Internet confirmed
+      lcd_draw_string(200, uplink_y + 3, "NET", THEME_DIM, THEME_BG);
+      draw_circle(228, uplink_y + 7, 5, THEME_OK); // Green = Internet confirmed
     }
     else if (uplink_state == UPLINK_PORTAL)
     {
-      lcd_draw_string(160, uplink_y + 3, "LOGIN", TERM_ACCENT, TERM_BG);
-      draw_circle(228, uplink_y + 7, 5, RGB565(0, 165, 255)); // Orange = Captive portal, login required
+      lcd_draw_string(160, uplink_y + 3, "LOGIN", THEME_TEXT, THEME_BG);
+      draw_circle(228, uplink_y + 7, 5, THEME_PORTAL); // Orange = Captive portal, login required
     }
     else if (uplink_state == UPLINK_NO_INTERNET)
     {
-      lcd_draw_string(152, uplink_y + 3, "NO NET", TERM_GREEN_DIM, TERM_BG);
-      draw_circle(228, uplink_y + 7, 5, RGB565(0, 0, 200)); // Red = Connected, but no internet
+      lcd_draw_string(152, uplink_y + 3, "NO NET", THEME_DIM, THEME_BG);
+      draw_circle(228, uplink_y + 7, 5, THEME_ERROR); // Red = Connected, but no internet
     }
     else if (uplink_state == UPLINK_CHECKING)
     {
-      lcd_draw_string(203, uplink_y + 3, "...", TERM_GREEN_DIM, TERM_BG);
-      draw_circle(228, uplink_y + 7, 5, RGB565(0, 200, 200)); // Yellow = Connected, checking...
+      lcd_draw_string(203, uplink_y + 3, "...", THEME_DIM, THEME_BG);
+      draw_circle(228, uplink_y + 7, 5, THEME_CHECKING); // Yellow = Connected, checking...
     }
     else
     {
-      draw_circle(228, uplink_y + 7, 5, RGB565(0, 0, 200)); // Red = No internet
+      draw_circle(228, uplink_y + 7, 5, THEME_ERROR); // Red = No internet
     }
 
     // WireGuard tunnel status
@@ -2992,25 +3014,25 @@ static void draw_status_screen(void)
                             : kill_switch_active() ? "VPN:BLK"
                             : (wg_peer_up ? "VPN:RDY" : "VPN:..");
       lcd_draw_string(232 - (int)strlen(vpn_str) * 8, uplink_y + 27, vpn_str,
-                      (wg_is_default || split_up) ? TERM_GREEN : TERM_GREEN_DIM, TERM_BG);
+                      (wg_is_default || split_up) ? THEME_OK : THEME_DIM, THEME_BG);
     }
     else if (wg_configured())
     {
-      lcd_draw_string(168, uplink_y + 27, "VPN:OFF", TERM_GREEN_DIM, TERM_BG); // V switches it on
+      lcd_draw_string(168, uplink_y + 27, "VPN:OFF", THEME_DIM, THEME_BG); // V switches it on
     }
   }
   else
   {
     // Disconnected state - network name and why the last attempt failed
-    lcd_draw_string(6, uplink_y + 14, network_ssid(active_network), TERM_GREEN_DIM, TERM_BG);
+    lcd_draw_string(6, uplink_y + 14, network_ssid(active_network), THEME_DIM, THEME_BG);
     char reason[32];
     if (last_disconnect_reason == 0)
       snprintf(reason, sizeof(reason), "Searching...");
     else
       snprintf(reason, sizeof(reason), "%s (%u)", disconnect_reason_text(last_disconnect_reason),
                (unsigned)last_disconnect_reason);
-    lcd_draw_string(6, uplink_y + 27, reason, TERM_ACCENT, TERM_BG);
-    draw_circle(228, uplink_y + 7, 5, RGB565(0, 0, 200)); // Red = Disconnected
+    lcd_draw_string(6, uplink_y + 27, reason, THEME_TEXT, THEME_BG);
+    draw_circle(228, uplink_y + 7, 5, THEME_ERROR); // Red = Disconnected
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -3019,27 +3041,27 @@ static void draw_status_screen(void)
   int ap_y = 62;
 
   // Draw AP box background with green border
-  lcd_fill_rect(2, ap_y, 236, 42, TERM_BG);
+  lcd_fill_rect(2, ap_y, 236, 42, THEME_BG);
   // Green border
-  lcd_fill_rect(2, ap_y, 236, 1, TERM_GREEN_DIM);      // Top
-  lcd_fill_rect(2, ap_y + 41, 236, 1, TERM_GREEN_DIM); // Bottom
-  lcd_fill_rect(2, ap_y, 1, 42, TERM_GREEN_DIM);       // Left
-  lcd_fill_rect(237, ap_y, 1, 42, TERM_GREEN_DIM);     // Right
+  lcd_fill_rect(2, ap_y, 236, 1, THEME_BORDER);      // Top
+  lcd_fill_rect(2, ap_y + 41, 236, 1, THEME_BORDER); // Bottom
+  lcd_fill_rect(2, ap_y, 1, 42, THEME_BORDER);       // Left
+  lcd_fill_rect(237, ap_y, 1, 42, THEME_BORDER);     // Right
 
   // AP label
-  lcd_draw_string(6, ap_y + 3, "ACCESS POINT", TERM_GREEN, TERM_BG);
+  lcd_draw_string(6, ap_y + 3, "ACCESS POINT", THEME_TITLE, THEME_BG);
 
   // AP SSID
-  lcd_draw_string(6, ap_y + 14, stored_config.ap_ssid, TERM_ACCENT, TERM_BG);
+  lcd_draw_string(6, ap_y + 14, stored_config.ap_ssid, THEME_TEXT, THEME_BG);
 
   // Password status
   if (strlen(stored_config.ap_password) > 0)
   {
-    lcd_draw_string(6, ap_y + 25, "Secured", TERM_GREEN_DIM, TERM_BG);
+    lcd_draw_string(6, ap_y + 25, "Secured", THEME_DIM, THEME_BG);
   }
   else
   {
-    lcd_draw_string(6, ap_y + 25, "Open", TERM_GREEN_DIM, TERM_BG);
+    lcd_draw_string(6, ap_y + 25, "Open", THEME_DIM, THEME_BG);
   }
 
   // Power settings (P / E keys), right-aligned
@@ -3048,12 +3070,12 @@ static void draw_status_screen(void)
     snprintf(power_str, sizeof(power_str), "%sTX:MAX", stored_config.eco_mode ? "ECO " : "");
   else
     snprintf(power_str, sizeof(power_str), "%sTX:%u", stored_config.eco_mode ? "ECO " : "", (unsigned)stored_config.tx_power);
-  lcd_draw_string(232 - (int)strlen(power_str) * 8, ap_y + 25, power_str, TERM_GREEN_DIM, TERM_BG);
+  lcd_draw_string(232 - (int)strlen(power_str) * 8, ap_y + 25, power_str, THEME_DIM, THEME_BG);
 
   // Client count (bright green to match theme)
   char clients_str[24];
   snprintf(clients_str, sizeof(clients_str), "CL:%d", ap_client_count);
-  lcd_draw_string(200, ap_y + 3, clients_str, TERM_GREEN, TERM_BG);
+  lcd_draw_string(200, ap_y + 3, clients_str, THEME_TITLE, THEME_BG);
 
   // ═══════════════════════════════════════════════════════════
   // CONFIG IP SECTION (Box 3) - Only if no clients
@@ -3063,15 +3085,15 @@ static void draw_status_screen(void)
     int config_y = 106;
 
     // Draw config box background with green border
-    lcd_fill_rect(2, config_y, 236, 18, TERM_BG);
+    lcd_fill_rect(2, config_y, 236, 18, THEME_BG);
     // Green border
-    lcd_fill_rect(2, config_y, 236, 1, TERM_GREEN_DIM);      // Top
-    lcd_fill_rect(2, config_y + 17, 236, 1, TERM_GREEN_DIM); // Bottom
-    lcd_fill_rect(2, config_y, 1, 18, TERM_GREEN_DIM);       // Left
-    lcd_fill_rect(237, config_y, 1, 18, TERM_GREEN_DIM);     // Right
+    lcd_fill_rect(2, config_y, 236, 1, THEME_BORDER);      // Top
+    lcd_fill_rect(2, config_y + 17, 236, 1, THEME_BORDER); // Bottom
+    lcd_fill_rect(2, config_y, 1, 18, THEME_BORDER);       // Left
+    lcd_fill_rect(237, config_y, 1, 18, THEME_BORDER);     // Right
 
-    lcd_draw_string(6, config_y + 5, "Config:", TERM_GREEN_DIM, TERM_BG);
-    lcd_draw_string(64, config_y + 5, ap_ip_str, TERM_GREEN, TERM_BG);
+    lcd_draw_string(6, config_y + 5, "Config:", THEME_DIM, THEME_BG);
+    lcd_draw_string(64, config_y + 5, ap_ip_str, THEME_TITLE, THEME_BG);
   }
 }
 
@@ -3140,11 +3162,11 @@ static void draw_reset_screen(const char *line1, const char *line2)
   xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
   reset_screen_shown = true;
   display_on = true;
-  lcd_fill_screen(TERM_BG);
-  lcd_fill_rect(0, 0, 240, 16, TERM_GREEN_DARK);
-  lcd_draw_string(68, 4, "FACTORY RESET", TERM_GREEN, TERM_GREEN_DARK);
-  lcd_draw_string(8, 50, line1, TERM_ACCENT, TERM_BG);
-  lcd_draw_string(8, 70, line2, TERM_GREEN_DIM, TERM_BG);
+  lcd_fill_screen(THEME_BG);
+  lcd_fill_rect(0, 0, 240, 16, THEME_BAR);
+  lcd_draw_string(68, 4, "FACTORY RESET", THEME_TITLE, THEME_BAR);
+  lcd_draw_string(8, 50, line1, THEME_TEXT, THEME_BG);
+  lcd_draw_string(8, 70, line2, THEME_DIM, THEME_BG);
   lcd_flush();
   gpio_set_level((gpio_num_t)LCD_BL_PIN, 1);
   xSemaphoreGiveRecursive(display_mutex);
@@ -3336,14 +3358,14 @@ static bool wg_configured(void)
 
 static void draw_menu_screen(void)
 {
-  lcd_fill_screen(TERM_BG);
-  lcd_fill_rect(0, 0, 240, 16, TERM_GREEN_DARK);
+  lcd_fill_screen(THEME_BG);
+  lcd_fill_rect(0, 0, 240, 16, THEME_BAR);
 
   if (wifi_menu.screen == MENU_SCANNING)
   {
-    lcd_draw_string(84, 4, "WIFI MENU", TERM_GREEN, TERM_GREEN_DARK);
-    lcd_draw_string(8, 56, "Scanning for networks...", TERM_ACCENT, TERM_BG);
-    lcd_draw_string(8, 122, "fn+`: cancel", TERM_GREEN_DIM, TERM_BG);
+    lcd_draw_string(84, 4, "WIFI MENU", THEME_TITLE, THEME_BAR);
+    lcd_draw_string(8, 56, "Scanning for networks...", THEME_TEXT, THEME_BG);
+    lcd_draw_string(8, 122, "fn+`: cancel", THEME_DIM, THEME_BG);
     return;
   }
 
@@ -3351,9 +3373,9 @@ static void draw_menu_screen(void)
   {
     char title[32];
     snprintf(title, sizeof(title), "WIFI MENU  %d networks", wifi_menu.count);
-    lcd_draw_string(8, 4, title, TERM_GREEN, TERM_GREEN_DARK);
+    lcd_draw_string(8, 4, title, THEME_TITLE, THEME_BAR);
     if (wifi_menu.count == 0)
-      lcd_draw_string(8, 40, "No networks found", TERM_ACCENT, TERM_BG);
+      lcd_draw_string(8, 40, "No networks found", THEME_TEXT, THEME_BG);
 
     for (int row = 0; row < MENU_VISIBLE_ROWS; row++)
     {
@@ -3363,44 +3385,44 @@ static void draw_menu_screen(void)
       const menu_network_t *n = &wifi_menu.networks[i];
       int y = 20 + row * 14;
       bool selected = i == wifi_menu.selected;
-      uint16_t bg = selected ? TERM_GREEN_DARK : TERM_BG;
+      uint16_t bg = selected ? THEME_BAR : THEME_BG;
       if (selected)
         lcd_fill_rect(0, y - 2, 240, 13, bg);
       char line[32];
       // '*' secured, '+' saved; name cut to fit, signal on the right
       snprintf(line, sizeof(line), "%c%c%-19.19s %4d", n->saved ? '+' : ' ', n->secured ? '*' : ' ', n->ssid,
                n->rssi);
-      lcd_draw_string(4, y, line, selected ? TERM_GREEN : TERM_ACCENT, bg);
+      lcd_draw_string(4, y, line, selected ? THEME_TITLE : THEME_TEXT, bg);
       if (strcmp(n->ssid, network_ssid(active_network)) == 0 && sta_connected)
-        lcd_draw_string(224, y, "<", TERM_GREEN, bg);
+        lcd_draw_string(224, y, "<", THEME_OK, bg);
     }
-    lcd_draw_string(4, 122, "Ent:join ;.:move R:scan fn+`", TERM_GREEN_DIM, TERM_BG);
+    lcd_draw_string(4, 122, "Ent:join ;.:move R:scan fn+`", THEME_DIM, THEME_BG);
     return;
   }
 
   if (wifi_menu.screen == MENU_PASSWORD)
   {
     const menu_network_t *n = wifi_menu_selected(&wifi_menu);
-    lcd_draw_string(8, 4, "PASSWORD", TERM_GREEN, TERM_GREEN_DARK);
-    lcd_draw_string(8, 24, n ? n->ssid : "", TERM_ACCENT, TERM_BG);
+    lcd_draw_string(8, 4, "PASSWORD", THEME_TITLE, THEME_BAR);
+    lcd_draw_string(8, 24, n ? n->ssid : "", THEME_TEXT, THEME_BG);
 
     // Input box: the last 27 characters, cursor at the end
-    lcd_fill_rect(4, 44, 232, 1, TERM_GREEN_DIM);
-    lcd_fill_rect(4, 62, 232, 1, TERM_GREEN_DIM);
+    lcd_fill_rect(4, 44, 232, 1, THEME_BORDER);
+    lcd_fill_rect(4, 62, 232, 1, THEME_BORDER);
     char shown[29];
     const char *text = wifi_menu.password;
     int len = wifi_menu.password_len;
     snprintf(shown, sizeof(shown), "%.27s_", len > 27 ? text + len - 27 : text);
-    lcd_draw_string(8, 50, shown, TERM_GREEN, TERM_BG);
+    lcd_draw_string(8, 50, shown, THEME_TITLE, THEME_BG);
 
     char info[32];
     if (len < MENU_PASSWORD_MIN)
       snprintf(info, sizeof(info), "%d characters (min %d)", len, MENU_PASSWORD_MIN);
     else
       snprintf(info, sizeof(info), "%d characters", len);
-    lcd_draw_string(8, 72, info, len < MENU_PASSWORD_MIN ? TERM_ACCENT : TERM_GREEN_DIM, TERM_BG);
-    lcd_draw_string(8, 108, "Shift: capitals/symbols", TERM_GREEN_DIM, TERM_BG);
-    lcd_draw_string(8, 122, "Ent:connect Del:erase fn+`", TERM_GREEN_DIM, TERM_BG);
+    lcd_draw_string(8, 72, info, len < MENU_PASSWORD_MIN ? THEME_TEXT : THEME_DIM, THEME_BG);
+    lcd_draw_string(8, 108, "Shift: capitals/symbols", THEME_DIM, THEME_BG);
+    lcd_draw_string(8, 122, "Ent:connect Del:erase fn+`", THEME_DIM, THEME_BG);
   }
 }
 

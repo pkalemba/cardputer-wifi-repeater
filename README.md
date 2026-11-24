@@ -44,7 +44,7 @@
 - **Network picker** in the web UI - press *Scan* and tap a network instead of typing the SSID
 
 ### 🖥️ Terminal UI
-- **Retro CRT Green Theme**: Classic terminal aesthetics on the Cardputer's LCD
+- **Gruvbox dark theme**: the same palette on the display and in the web panel
 - **Real-time Status Display**: 
   - 🟢 Uplink connection status with RSSI signal strength
   - 📶 Live client count
