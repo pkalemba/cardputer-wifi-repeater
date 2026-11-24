@@ -58,18 +58,11 @@
 #include "qrcodegen/qrcodegen.h" // Nayuki QR Code generator (MIT), vendored
 #include "wireguard.h" // peer state for the debug page (library pinned in platformio.ini)
 
-// Battery (ADC) includes
-#include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
-
-// Display includes
-#include "driver/spi_master.h"
+// Shared Cardputer code (lib/cardputer): display, battery, G0 button, ADV keyboard
+#include "cardputer_battery.h"
+#include "cardputer_display.h"
+#include "cardputer_input.h"
 #include "driver/gpio.h"
-#include "driver/i2c_master.h"
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_vendor.h"
-#include "esp_lcd_panel_ops.h"
 
 // Web server includes
 #include "esp_http_server.h"
@@ -395,7 +388,7 @@ static bool wg_connected = false;
 static bool wg_peer_up = false;
 static char wg_status[96] = "disabled";
 static volatile bool wg_toggle_requested = false; // V key, handled in the status task
-static wifi_menu_t wifi_menu = {};                 // W key; MENU_CLOSED, changed in the UI task under display_mutex
+static wifi_menu_t wifi_menu = {};                 // W key; MENU_CLOSED, changed in the UI task under display_lock()
 static void draw_menu_screen(void);
 static volatile bool qr_screen_shown = false; // Q key: QR code to join the repeater's WiFi
 static void draw_qr_screen(void);
@@ -472,208 +465,22 @@ static bool kill_switch_active(void)
 /* Status task handle (notified on uplink changes) */
 static TaskHandle_t status_task_handle = NULL;
 
-/* M5Stack Cardputer Display Pin Configuration */
-#define LCD_MOSI_PIN 35 // DATA
-#define LCD_SCLK_PIN 36 // SCK
-#define LCD_CS_PIN 37   // CS
-#define LCD_DC_PIN 34   // RS/DC
-#define LCD_RST_PIN 33  // RST
-#define LCD_BL_PIN 38   // Backlight
-
-#define LCD_H_RES 136
-#define LCD_V_RES 240
-#define LCD_PIXEL_CLK 40000000
-
-/* M5Stack Cardputer ADV keyboard: TCA8418 key matrix controller on I2C */
-#define KEYBOARD_SDA_PIN 8
-#define KEYBOARD_SCL_PIN 9
-#define TCA8418_ADDR 0x34
-#define TCA8418_REG_CFG 0x01
-#define TCA8418_REG_INT_STAT 0x02
-#define TCA8418_REG_KEY_LCK_EC 0x03
-#define TCA8418_REG_KEY_EVENT_A 0x04
-#define TCA8418_REG_KP_GPIO_1 0x1D
-#define TCA8418_REG_KP_GPIO_2 0x1E
-#define TCA8418_REG_KP_GPIO_3 0x1F
-#define TCA8418_KEY_PRESSED 0x80
-/* Key numbers -> characters: keyboard_key_code() in wifi_menu.cpp */
-
-/* M5Stack Cardputer G0 button and battery */
-#define BUTTON_G0_PIN 0            // active low; also a strapping pin (download mode at reset)
-#define BATTERY_ADC_PIN 10         // battery voltage through a 1:2 divider
-#define BATTERY_DIVIDER 2
+/* Display, keyboard, G0 button and battery: lib/cardputer */
 #define FACTORY_RESET_HOLD_MS 5000 // hold G0 this long to erase all settings
 
 /* Web Server Configuration */
 #define WEB_SERVER_STACK_SIZE 8192
 
-/* Display handles */
-static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
-static esp_lcd_panel_handle_t lcd_panel_handle = NULL;
 static int ap_client_count = 0;
 
 /* Display power and locking - the screen is drawn from several tasks */
-static SemaphoreHandle_t display_mutex = NULL; // recursive, guards framebuffer and backlight
 static volatile bool display_on = true;
 static volatile bool reset_screen_shown = false; // factory reset countdown owns the screen
 static volatile TickType_t last_activity_tick = 0;
 
-/* Battery voltage in mV (smoothed), -1 = unknown */
-static int battery_mv = -1;
-
 /* Web server handle */
 static httpd_handle_t web_server = NULL;
 static bool config_mode = false;
-
-/**
- * RGB565 Color definitions (byte-swapped for ST7789)
- */
-#define RGB565(r, g, b) ({                                              \
-  uint16_t rgb = ((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3)); \
-  ((rgb >> 8) | (rgb << 8));                                            \
-})
-#define COLOR_BLACK RGB565(0, 0, 0)
-#define COLOR_WHITE RGB565(255, 255, 255)
-#define COLOR_RED RGB565(255, 0, 0)
-#define COLOR_GREEN RGB565(0, 255, 0)
-#define COLOR_BLUE RGB565(0, 0, 255)
-#define COLOR_YELLOW RGB565(255, 255, 0)
-#define COLOR_CYAN RGB565(0, 255, 255)
-#define COLOR_NAVY RGB565(0, 0, 128)
-#define COLOR_DARKGREEN RGB565(0, 128, 0)
-#define COLOR_ORANGE RGB565(255, 165, 0)
-
-/* The panel is set up as BGR, so RGB565() takes the channels the other way
- * round - DISPLAY_RGB() takes a normal R, G, B color */
-#define DISPLAY_RGB(r, g, b) RGB565(b, g, r)
-
-/* Gruvbox dark - the same palette as the web panel */
-#define GRUV_BG0 DISPLAY_RGB(0x28, 0x28, 0x28)
-#define GRUV_BG1 DISPLAY_RGB(0x3c, 0x38, 0x36)
-#define GRUV_BG2 DISPLAY_RGB(0x50, 0x49, 0x45)
-#define GRUV_BG3 DISPLAY_RGB(0x66, 0x5c, 0x54)
-#define GRUV_FG DISPLAY_RGB(0xeb, 0xdb, 0xb2)
-#define GRUV_FG4 DISPLAY_RGB(0xa8, 0x99, 0x84)
-#define GRUV_YELLOW DISPLAY_RGB(0xfa, 0xbd, 0x2f)
-#define GRUV_GREEN DISPLAY_RGB(0xb8, 0xbb, 0x26)
-#define GRUV_ORANGE DISPLAY_RGB(0xfe, 0x80, 0x19)
-#define GRUV_RED DISPLAY_RGB(0xfb, 0x49, 0x34)
-#define GRUV_AQUA DISPLAY_RGB(0x8e, 0xc0, 0x7c)
-
-/* Display colors by role */
-#define THEME_BG GRUV_BG0      // background
-#define THEME_BAR GRUV_BG1     // title bars, selected menu row
-#define THEME_BORDER GRUV_BG3  // box borders
-#define THEME_TITLE GRUV_YELLOW // titles and labels
-#define THEME_TEXT GRUV_FG     // values (network names, ...)
-#define THEME_DIM GRUV_FG4     // secondary text
-#define THEME_OK GRUV_GREEN    // online, VPN up, signal, battery
-#define THEME_CHECKING GRUV_YELLOW
-#define THEME_PORTAL GRUV_ORANGE
-#define THEME_ERROR GRUV_RED
-
-// Simple 8x8 font bitmap (ASCII 32-127) - abbreviated for space
-static const uint8_t font8x8[96][8] = {
-    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // space
-    {0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00}, // !
-    {0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // "
-    {0x36, 0x36, 0x7F, 0x36, 0x7F, 0x36, 0x36, 0x00}, // #
-    {0x0C, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x0C, 0x00}, // $
-    {0x00, 0x63, 0x33, 0x18, 0x0C, 0x66, 0x63, 0x00}, // %
-    {0x1C, 0x36, 0x1C, 0x6E, 0x3B, 0x33, 0x6E, 0x00}, // &
-    {0x06, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00}, // '
-    {0x18, 0x0C, 0x06, 0x06, 0x06, 0x0C, 0x18, 0x00}, // (
-    {0x06, 0x0C, 0x18, 0x18, 0x18, 0x0C, 0x06, 0x00}, // )
-    {0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00}, // *
-    {0x00, 0x0C, 0x0C, 0x3F, 0x0C, 0x0C, 0x00, 0x00}, // +
-    {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x06}, // ,
-    {0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00}, // -
-    {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00}, // .
-    {0x60, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x01, 0x00}, // /
-    {0x3E, 0x63, 0x73, 0x7B, 0x6F, 0x67, 0x3E, 0x00}, // 0
-    {0x0C, 0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x3F, 0x00}, // 1
-    {0x1E, 0x33, 0x30, 0x1C, 0x06, 0x33, 0x3F, 0x00}, // 2
-    {0x1E, 0x33, 0x30, 0x1C, 0x30, 0x33, 0x1E, 0x00}, // 3
-    {0x38, 0x3C, 0x36, 0x33, 0x7F, 0x30, 0x78, 0x00}, // 4
-    {0x3F, 0x03, 0x1F, 0x30, 0x30, 0x33, 0x1E, 0x00}, // 5
-    {0x1C, 0x06, 0x03, 0x1F, 0x33, 0x33, 0x1E, 0x00}, // 6
-    {0x3F, 0x33, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x00}, // 7
-    {0x1E, 0x33, 0x33, 0x1E, 0x33, 0x33, 0x1E, 0x00}, // 8
-    {0x1E, 0x33, 0x33, 0x3E, 0x30, 0x18, 0x0E, 0x00}, // 9
-    {0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x00}, // :
-    {0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x06}, // ;
-    {0x18, 0x0C, 0x06, 0x03, 0x06, 0x0C, 0x18, 0x00}, // <
-    {0x00, 0x00, 0x3F, 0x00, 0x00, 0x3F, 0x00, 0x00}, // =
-    {0x06, 0x0C, 0x18, 0x30, 0x18, 0x0C, 0x06, 0x00}, // >
-    {0x1E, 0x33, 0x30, 0x18, 0x0C, 0x00, 0x0C, 0x00}, // ?
-    {0x3E, 0x63, 0x7B, 0x7B, 0x7B, 0x03, 0x1E, 0x00}, // @
-    {0x0C, 0x1E, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x00}, // A
-    {0x3F, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3F, 0x00}, // B
-    {0x3C, 0x66, 0x03, 0x03, 0x03, 0x66, 0x3C, 0x00}, // C
-    {0x1F, 0x36, 0x66, 0x66, 0x66, 0x36, 0x1F, 0x00}, // D
-    {0x7F, 0x46, 0x16, 0x1E, 0x16, 0x46, 0x7F, 0x00}, // E
-    {0x7F, 0x46, 0x16, 0x1E, 0x16, 0x06, 0x0F, 0x00}, // F
-    {0x3C, 0x66, 0x03, 0x03, 0x73, 0x66, 0x7C, 0x00}, // G
-    {0x33, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x33, 0x00}, // H
-    {0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00}, // I
-    {0x78, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E, 0x00}, // J
-    {0x67, 0x66, 0x36, 0x1E, 0x36, 0x66, 0x67, 0x00}, // K
-    {0x0F, 0x06, 0x06, 0x06, 0x46, 0x66, 0x7F, 0x00}, // L
-    {0x63, 0x77, 0x7F, 0x7F, 0x6B, 0x63, 0x63, 0x00}, // M
-    {0x63, 0x67, 0x6F, 0x7B, 0x73, 0x63, 0x63, 0x00}, // N
-    {0x1C, 0x36, 0x63, 0x63, 0x63, 0x36, 0x1C, 0x00}, // O
-    {0x3F, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x0F, 0x00}, // P
-    {0x1E, 0x33, 0x33, 0x33, 0x3B, 0x1E, 0x38, 0x00}, // Q
-    {0x3F, 0x66, 0x66, 0x3E, 0x36, 0x66, 0x67, 0x00}, // R
-    {0x1E, 0x33, 0x07, 0x0E, 0x38, 0x33, 0x1E, 0x00}, // S
-    {0x3F, 0x2D, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00}, // T
-    {0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x3F, 0x00}, // U
-    {0x33, 0x33, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00}, // V
-    {0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00}, // W
-    {0x63, 0x63, 0x36, 0x1C, 0x1C, 0x36, 0x63, 0x00}, // X
-    {0x33, 0x33, 0x33, 0x1E, 0x0C, 0x0C, 0x1E, 0x00}, // Y
-    {0x7F, 0x63, 0x31, 0x18, 0x4C, 0x66, 0x7F, 0x00}, // Z
-    {0x1E, 0x06, 0x06, 0x06, 0x06, 0x06, 0x1E, 0x00}, // [
-    {0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0x00}, // backslash
-    {0x1E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x1E, 0x00}, // ]
-    {0x08, 0x1C, 0x36, 0x63, 0x00, 0x00, 0x00, 0x00}, // ^
-    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF}, // _
-    {0x0C, 0x0C, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00}, // `
-    {0x00, 0x00, 0x1E, 0x30, 0x3E, 0x33, 0x6E, 0x00}, // a
-    {0x07, 0x06, 0x06, 0x3E, 0x66, 0x66, 0x3B, 0x00}, // b
-    {0x00, 0x00, 0x1E, 0x33, 0x03, 0x33, 0x1E, 0x00}, // c
-    {0x38, 0x30, 0x30, 0x3e, 0x33, 0x33, 0x6E, 0x00}, // d
-    {0x00, 0x00, 0x1E, 0x33, 0x3f, 0x03, 0x1E, 0x00}, // e
-    {0x1C, 0x36, 0x06, 0x0f, 0x06, 0x06, 0x0F, 0x00}, // f
-    {0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x1F}, // g
-    {0x07, 0x06, 0x36, 0x6E, 0x66, 0x66, 0x67, 0x00}, // h
-    {0x0C, 0x00, 0x0E, 0x0C, 0x0C, 0x0C, 0x1E, 0x00}, // i
-    {0x30, 0x00, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E}, // j
-    {0x07, 0x06, 0x66, 0x36, 0x1E, 0x36, 0x67, 0x00}, // k
-    {0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00}, // l
-    {0x00, 0x00, 0x33, 0x7F, 0x7F, 0x6B, 0x63, 0x00}, // m
-    {0x00, 0x00, 0x1F, 0x33, 0x33, 0x33, 0x33, 0x00}, // n
-    {0x00, 0x00, 0x1E, 0x33, 0x33, 0x33, 0x1E, 0x00}, // o
-    {0x00, 0x00, 0x3B, 0x66, 0x66, 0x3E, 0x06, 0x0F}, // p
-    {0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x78}, // q
-    {0x00, 0x00, 0x3B, 0x6E, 0x66, 0x06, 0x0F, 0x00}, // r
-    {0x00, 0x00, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x00}, // s
-    {0x08, 0x0C, 0x3E, 0x0C, 0x0C, 0x2C, 0x18, 0x00}, // t
-    {0x00, 0x00, 0x33, 0x33, 0x33, 0x33, 0x6E, 0x00}, // u
-    {0x00, 0x00, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00}, // v
-    {0x00, 0x00, 0x63, 0x6B, 0x7F, 0x7F, 0x36, 0x00}, // w
-    {0x00, 0x00, 0x63, 0x36, 0x1C, 0x36, 0x63, 0x00}, // x
-    {0x00, 0x00, 0x33, 0x33, 0x33, 0x3E, 0x30, 0x1F}, // y
-    {0x00, 0x00, 0x3F, 0x19, 0x0C, 0x26, 0x3F, 0x00}, // z
-    {0x38, 0x0C, 0x0C, 0x07, 0x0C, 0x0C, 0x38, 0x00}, // {
-    {0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x00}, // |
-    {0x07, 0x0C, 0x0C, 0x38, 0x0C, 0x0C, 0x07, 0x00}, // }
-    {0x6E, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // ~
-    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}  // del
-};
-
-// Display buffer (rotated: 240x135)
-static uint16_t *framebuffer = NULL;
 
 /* ═══════════════════════════════════════════════════════════════════
  * WEB SERVER HTML PAGES
@@ -1150,294 +957,19 @@ static const char *html_success_page =
     "</div></body></html>";
 
 /**
- * Fill screen with a color
- */
-static void lcd_fill_screen(uint16_t color)
-{
-  if (!framebuffer)
-    return;
-
-  for (int i = 0; i < LCD_V_RES * LCD_H_RES; i++)
-  {
-    framebuffer[i] = color;
-  }
-}
-
-/**
- * Draw a character at position (x, y)
- */
-/* Arrows for the key hints, at their CP437 codes: 0x18 up, 0x19 down, 0x1A right, 0x1B left */
-#define CHAR_UP "\x18"
-#define CHAR_DOWN "\x19"
-#define CHAR_RIGHT "\x1A"
-#define CHAR_LEFT "\x1B"
-static const uint8_t arrow_glyphs[4][8] = {
-    {0x18, 0x3C, 0x7E, 0x18, 0x18, 0x18, 0x18, 0x00}, // up
-    {0x18, 0x18, 0x18, 0x18, 0x7E, 0x3C, 0x18, 0x00}, // down
-    {0x10, 0x30, 0x70, 0x7F, 0x7F, 0x70, 0x30, 0x10}, // right
-    {0x04, 0x06, 0x07, 0x7F, 0x7F, 0x07, 0x06, 0x04}, // left
-};
-
-static void lcd_draw_char(int x, int y, char c, uint16_t color, uint16_t bg_color)
-{
-  const uint8_t *glyph;
-  if (c >= 0x18 && c <= 0x1B)
-    glyph = arrow_glyphs[c - 0x18];
-  else if (c >= 32 && c <= 127)
-    glyph = font8x8[c - 32];
-  else
-    return;
-  if (!framebuffer)
-    return;
-
-  for (int py = 0; py < 8; py++)
-  {
-    uint8_t line = glyph[py];
-    for (int px = 0; px < 8; px++)
-    {
-      int screen_x = x + px;
-      int screen_y = y + py;
-
-      if (screen_x >= 0 && screen_x < LCD_V_RES && screen_y >= 0 && screen_y < LCD_H_RES)
-      {
-        // Check bit from LSB side (bit 0 = leftmost pixel)
-        bool pixel_on = (line & (1 << px));
-        framebuffer[screen_y * LCD_V_RES + screen_x] = pixel_on ? color : bg_color;
-      }
-    }
-  }
-}
-
-/**
- * Draw a string at position (x, y)
- */
-static void lcd_draw_string(int x, int y, const char *str, uint16_t color, uint16_t bg_color)
-{
-  int cursor_x = x;
-  while (*str)
-  {
-    lcd_draw_char(cursor_x, y, *str, color, bg_color);
-    cursor_x += 8;
-    str++;
-  }
-}
-
-/**
- * Draw a filled rectangle
- */
-static void lcd_fill_rect(int x, int y, int w, int h, uint16_t color)
-{
-  if (!framebuffer)
-    return;
-
-  for (int py = 0; py < h; py++)
-  {
-    for (int px = 0; px < w; px++)
-    {
-      int screen_x = x + px;
-      int screen_y = y + py;
-
-      if (screen_x >= 0 && screen_x < LCD_V_RES && screen_y >= 0 && screen_y < LCD_H_RES)
-      {
-        framebuffer[screen_y * LCD_V_RES + screen_x] = color;
-      }
-    }
-  }
-}
-
-/**
- * Flush framebuffer to display
- */
-static void lcd_flush(void)
-{
-  if (!lcd_panel_handle || !framebuffer)
-    return;
-  esp_lcd_panel_draw_bitmap(lcd_panel_handle, 0, 0, LCD_V_RES, LCD_H_RES, framebuffer);
-}
-
-/**
- * Initialize Display
+ * Display (lib/cardputer) and the start screen
  */
 static void display_init(void)
 {
-  display_mutex = xSemaphoreCreateRecursiveMutex();
-
-  ESP_LOGI(TAG_MAIN, "Initializing SPI bus for LCD");
-
-  // Configure backlight - turn OFF first, then ON after display init
-  gpio_config_t bk_gpio_config = {
-      .pin_bit_mask = 1ULL << LCD_BL_PIN,
-      .mode = GPIO_MODE_OUTPUT,
-  };
-  gpio_config(&bk_gpio_config);
-  gpio_set_level((gpio_num_t)LCD_BL_PIN, 0); // Turn off initially
-  ESP_LOGI(TAG_MAIN, "Backlight pin %d configured (OFF for now)", LCD_BL_PIN);
-
-  // Configure SPI bus
-  spi_bus_config_t buscfg = {
-      .mosi_io_num = LCD_MOSI_PIN,
-      .miso_io_num = -1,
-      .sclk_io_num = LCD_SCLK_PIN,
-      .quadwp_io_num = -1,
-      .quadhd_io_num = -1,
-      .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t),
-  };
-  ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
-
-  // Configure LCD panel IO
-  esp_lcd_panel_io_spi_config_t io_config = {
-      .cs_gpio_num = LCD_CS_PIN,
-      .dc_gpio_num = LCD_DC_PIN,
-      .spi_mode = 0,
-      .pclk_hz = LCD_PIXEL_CLK,
-      .trans_queue_depth = 10,
-      .lcd_cmd_bits = 8,
-      .lcd_param_bits = 8,
-  };
-  ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_config, &lcd_io_handle));
-
-  // Configure LCD panel
-  esp_lcd_panel_dev_config_t panel_config = {
-      .reset_gpio_num = LCD_RST_PIN,
-      .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
-      .bits_per_pixel = 16,
-  };
-  ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io_handle, &panel_config, &lcd_panel_handle));
-
-  // Reset and initialize panel
-  ESP_LOGI(TAG_MAIN, "Resetting display...");
-  esp_lcd_panel_reset(lcd_panel_handle);
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  ESP_LOGI(TAG_MAIN, "Initializing display...");
-  esp_lcd_panel_init(lcd_panel_handle);
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  ESP_LOGI(TAG_MAIN, "Setting display orientation and gap");
-
-  // ST7789V2 on M5Stack Cardputer needs these settings
-  esp_lcd_panel_invert_color(lcd_panel_handle, true);
-
-  // Set gap for 135x240 display (52x40 offset)
-  esp_lcd_panel_set_gap(lcd_panel_handle, 40, 52);
-
-  // Set orientation - landscape mode for 240x135
-  // Swap XY to rotate from portrait to landscape
-  esp_lcd_panel_swap_xy(lcd_panel_handle, true);
-  // Mirror to get correct orientation
-  esp_lcd_panel_mirror(lcd_panel_handle, true, false);
-
-  // Turn display on
-  ESP_LOGI(TAG_MAIN, "Turning display ON");
-  esp_lcd_panel_disp_on_off(lcd_panel_handle, true);
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  // Now turn on backlight
-  ESP_LOGI(TAG_MAIN, "Turning backlight ON");
-  gpio_set_level((gpio_num_t)LCD_BL_PIN, 1);
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  // Allocate framebuffer
-  framebuffer = (uint16_t *)heap_caps_malloc(LCD_V_RES * LCD_H_RES * sizeof(uint16_t), MALLOC_CAP_DMA);
-  if (!framebuffer)
-  {
-    ESP_LOGE(TAG_MAIN, "Failed to allocate framebuffer");
+  if (!lcd_init())
     return;
-  }
-
-  ESP_LOGI(TAG_MAIN, "Display ready: %dx%d, framebuffer: %p", LCD_V_RES, LCD_H_RES, framebuffer);
-
-  // Draw initial splash screen
   lcd_fill_screen(THEME_BG);
-
-  // Header
   lcd_fill_rect(0, 0, 240, 18, THEME_BAR);
   lcd_draw_string(50, 5, "WiFi REPEATER", THEME_TITLE, THEME_BAR);
-
-  // Status message
   lcd_draw_string(30, 50, "Initializing...", THEME_TEXT, THEME_BG);
   lcd_draw_string(30, 70, "Starting WiFi", THEME_DIM, THEME_BG);
-
   lcd_flush();
-
-  ESP_LOGI(TAG_MAIN, "Display initialized successfully");
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * BATTERY
- * ═══════════════════════════════════════════════════════════════════ */
-
-static adc_oneshot_unit_handle_t battery_adc = NULL;
-static adc_channel_t battery_channel;
-static adc_cali_handle_t battery_cali = NULL;
-
-/**
- * Set up the ADC for the battery voltage (GPIO10, 1:2 divider)
- */
-static void battery_init(void)
-{
-  adc_unit_t unit;
-  if (adc_oneshot_io_to_channel(BATTERY_ADC_PIN, &unit, &battery_channel) != ESP_OK)
-    return;
-
-  adc_oneshot_unit_init_cfg_t unit_config = {};
-  unit_config.unit_id = unit;
-  if (adc_oneshot_new_unit(&unit_config, &battery_adc) != ESP_OK)
-  {
-    ESP_LOGW(TAG_MAIN, "Battery ADC not available");
-    battery_adc = NULL;
-    return;
-  }
-
-  adc_oneshot_chan_cfg_t channel_config = {};
-  channel_config.atten = ADC_ATTEN_DB_12;
-  channel_config.bitwidth = ADC_BITWIDTH_12;
-  adc_oneshot_config_channel(battery_adc, battery_channel, &channel_config);
-
-  adc_cali_curve_fitting_config_t cali_config = {};
-  cali_config.unit_id = unit;
-  cali_config.chan = battery_channel;
-  cali_config.atten = ADC_ATTEN_DB_12;
-  cali_config.bitwidth = ADC_BITWIDTH_12;
-  if (adc_cali_create_scheme_curve_fitting(&cali_config, &battery_cali) != ESP_OK)
-    battery_cali = NULL;
-}
-
-/**
- * Measure the battery voltage (16 samples, smoothed over time)
- */
-static void battery_sample(void)
-{
-  if (!battery_adc)
-    return;
-
-  int sum = 0;
-  int count = 0;
-  for (int i = 0; i < 16; i++)
-  {
-    int raw, mv;
-    if (adc_oneshot_read(battery_adc, battery_channel, &raw) != ESP_OK)
-      continue;
-    if (battery_cali && adc_cali_raw_to_voltage(battery_cali, raw, &mv) == ESP_OK)
-      sum += mv;
-    else
-      sum += raw * 3100 / 4095; // uncalibrated estimate for 12 dB attenuation
-    count++;
-  }
-  if (count == 0)
-    return;
-
-  int mv = sum / count * BATTERY_DIVIDER;
-  battery_mv = battery_mv < 0 ? mv : (battery_mv * 3 + mv) / 4;
-}
-
-/**
- * Battery level in percent - same mapping as M5Unified (3.3 V = 0 %, 4.1 V = 100 %)
- */
-static int battery_percent(void)
-{
-  int level = (battery_mv - 3300) * 100 / 800;
-  return level < 0 ? 0 : (level > 100 ? 100 : level);
+  lcd_backlight(true);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -3066,86 +2598,8 @@ static void stop_webserver(httpd_handle_t server)
 }
 
 /**
- * Draw signal strength bars (1-4 bars based on RSSI)
- */
-static void draw_signal_bars(int x, int y, int rssi)
-{
-  // Calculate number of bars (1-4) based on RSSI
-  int bars = 1;
-  if (rssi > -70)
-    bars = 4;
-  else if (rssi > -80)
-    bars = 3;
-  else if (rssi > -90)
-    bars = 2;
-
-  uint16_t bar_color = THEME_OK;
-
-  // Draw 4 bars with increasing height
-  for (int i = 0; i < 4; i++)
-  {
-    int bar_height = 2 + (i * 2);                                 // Heights: 2, 4, 6, 8
-    int bar_y = y + (8 - bar_height);                             // Align bottom
-    uint16_t color = (i < bars) ? bar_color : GRUV_BG2; // inactive bars
-    lcd_fill_rect(x + (i * 4), bar_y, 3, bar_height, color);
-  }
-}
-
-/**
- * Draw a filled circle (using filled rectangle approximation)
- */
-static void draw_circle(int x, int y, int radius, uint16_t color)
-{
-  for (int dy = -radius; dy <= radius; dy++)
-  {
-    for (int dx = -radius; dx <= radius; dx++)
-    {
-      if (dx * dx + dy * dy <= radius * radius)
-      {
-        if (x + dx >= 0 && x + dx < LCD_V_RES && y + dy >= 0 && y + dy < LCD_H_RES)
-        {
-          framebuffer[(y + dy) * LCD_V_RES + (x + dx)] = color;
-        }
-      }
-    }
-  }
-}
-
-/**
- * Draw the battery level (percentage and icon), right-aligned at right_x
- */
-static void draw_battery(int right_x, int y, uint16_t bg_color)
-{
-  if (battery_mv < 0)
-    return;
-
-  int level = battery_percent();
-  uint16_t color = level <= 15 ? THEME_ERROR : THEME_OK; // red when low
-
-  // 18x9 outline with a 2x5 terminal on the right
-  int x = right_x - 20;
-  lcd_fill_rect(x, y, 18, 9, color);
-  lcd_fill_rect(x + 1, y + 1, 16, 7, bg_color);
-  lcd_fill_rect(x + 18, y + 2, 2, 5, color);
-  lcd_fill_rect(x + 2, y + 2, 14 * level / 100, 5, color);
-
-  char text[12];
-  snprintf(text, sizeof(text), "%d%%", level);
-  lcd_draw_string(x - 4 - (int)strlen(text) * 8, y + 1, text, color, bg_color);
-}
-
-/**
  * Setup mode screen: how to reach the configuration page
  */
-/* One pixel frame in the border color */
-static void draw_frame(int x, int y, int w, int h)
-{
-  lcd_fill_rect(x, y, w, 1, THEME_BORDER);
-  lcd_fill_rect(x, y + h - 1, w, 1, THEME_BORDER);
-  lcd_fill_rect(x, y, 1, h, THEME_BORDER);
-  lcd_fill_rect(x + w - 1, y, 1, h, THEME_BORDER);
-}
-
 #define QR_MAX_VERSION 10 // 57 modules: the longest SSID + password with every character escaped
 
 static uint8_t wifi_qr[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
@@ -3190,7 +2644,7 @@ static void draw_setup_screen(void)
   lcd_fill_screen(THEME_BG);
   lcd_fill_rect(0, 0, 240, 16, THEME_BAR);
   lcd_draw_string(6, 4, "SETUP MODE", THEME_TITLE, THEME_BAR);
-  draw_battery(236, 3, THEME_BAR);
+  ui_draw_battery(236, 3, THEME_BAR);
 
   // QR code in a frame, vertically centered below the header
   const int area_top = 18, area_height = 135 - area_top;
@@ -3201,7 +2655,7 @@ static void draw_setup_screen(void)
     int size = qrcodegen_getSize(wifi_qr);
     int top = area_top + (area_height - (size + 4) * scale) / 2;
     side = wifi_qr_draw(6, top, scale);
-    draw_frame(3, top - 3, side + 6, side + 6);
+    ui_draw_frame(3, top - 3, side + 6, side + 6);
   }
 
   // Steps
@@ -3220,7 +2674,7 @@ static void draw_setup_screen(void)
   for (int i = 0; i < 3; i++)
   {
     int y = area_top + 2 + i * 39;
-    draw_frame(x, y, w, 36);
+    ui_draw_frame(x, y, w, 36);
     lcd_draw_string(x + 4, y + 5, steps[i].title, THEME_TITLE, THEME_BG);
     char value[32];
     snprintf(value, sizeof(value), "%.*s", columns < 31 ? columns : 31, steps[i].value);
@@ -3241,7 +2695,7 @@ static void draw_status_screen(void)
   // ═══════════════════════════════════════════════════════════
   lcd_fill_rect(0, 0, 240, 16, THEME_BAR);
   lcd_draw_string(6, 4, "Card Wifi Repeater", THEME_TITLE, THEME_BAR);
-  draw_battery(236, 3, THEME_BAR);
+  ui_draw_battery(236, 3, THEME_BAR);
 
   // ═══════════════════════════════════════════════════════════
   // UPLINK SECTION (Box 1)
@@ -3268,7 +2722,7 @@ static void draw_status_screen(void)
       lcd_draw_string(6, uplink_y + 14, network_ssid(active_network), THEME_TEXT, THEME_BG);
 
       // Signal strength bars
-      draw_signal_bars(6, uplink_y + 27, ap_info.rssi);
+      ui_draw_signal_bars(6, uplink_y + 27, ap_info.rssi);
 
       // RSSI value
       char rssi_str[16];
@@ -3280,26 +2734,26 @@ static void draw_status_screen(void)
     if (uplink_state == UPLINK_ONLINE)
     {
       lcd_draw_string(200, uplink_y + 3, "NET", THEME_DIM, THEME_BG);
-      draw_circle(228, uplink_y + 7, 5, THEME_OK); // Green = Internet confirmed
+      lcd_fill_circle(228, uplink_y + 7, 5, THEME_OK); // Green = Internet confirmed
     }
     else if (uplink_state == UPLINK_PORTAL)
     {
       lcd_draw_string(160, uplink_y + 3, "LOGIN", THEME_TEXT, THEME_BG);
-      draw_circle(228, uplink_y + 7, 5, THEME_PORTAL); // Orange = Captive portal, login required
+      lcd_fill_circle(228, uplink_y + 7, 5, THEME_PORTAL); // Orange = Captive portal, login required
     }
     else if (uplink_state == UPLINK_NO_INTERNET)
     {
       lcd_draw_string(152, uplink_y + 3, "NO NET", THEME_DIM, THEME_BG);
-      draw_circle(228, uplink_y + 7, 5, THEME_ERROR); // Red = Connected, but no internet
+      lcd_fill_circle(228, uplink_y + 7, 5, THEME_ERROR); // Red = Connected, but no internet
     }
     else if (uplink_state == UPLINK_CHECKING)
     {
       lcd_draw_string(203, uplink_y + 3, "...", THEME_DIM, THEME_BG);
-      draw_circle(228, uplink_y + 7, 5, THEME_CHECKING); // Yellow = Connected, checking...
+      lcd_fill_circle(228, uplink_y + 7, 5, THEME_CHECKING); // Yellow = Connected, checking...
     }
     else
     {
-      draw_circle(228, uplink_y + 7, 5, THEME_ERROR); // Red = No internet
+      lcd_fill_circle(228, uplink_y + 7, 5, THEME_ERROR); // Red = No internet
     }
 
     // WireGuard tunnel status
@@ -3329,7 +2783,7 @@ static void draw_status_screen(void)
       snprintf(reason, sizeof(reason), "%s (%u)", disconnect_reason_text(last_disconnect_reason),
                (unsigned)last_disconnect_reason);
     lcd_draw_string(6, uplink_y + 27, reason, THEME_TEXT, THEME_BG);
-    draw_circle(228, uplink_y + 7, 5, THEME_ERROR); // Red = Disconnected
+    lcd_fill_circle(228, uplink_y + 7, 5, THEME_ERROR); // Red = Disconnected
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -3399,10 +2853,10 @@ static void draw_status_screen(void)
  */
 static void display_update_status(void)
 {
-  if (!framebuffer)
+  if (!lcd_ready())
     return;
 
-  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  display_lock();
   if (display_on && !reset_screen_shown)
   {
     if (config_mode)
@@ -3417,7 +2871,7 @@ static void display_update_status(void)
       draw_status_screen();
     lcd_flush();
   }
-  xSemaphoreGiveRecursive(display_mutex);
+  display_unlock();
 }
 
 /**
@@ -3426,14 +2880,14 @@ static void display_update_status(void)
  */
 static void display_wake(void)
 {
-  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  display_lock();
   last_activity_tick = xTaskGetTickCount();
   bool was_off = !display_on;
   display_on = true;
   display_update_status(); // draw before the backlight comes on
   if (was_off)
-    gpio_set_level((gpio_num_t)LCD_BL_PIN, 1);
-  xSemaphoreGiveRecursive(display_mutex);
+    lcd_backlight(true);
+  display_unlock();
 }
 
 /**
@@ -3441,14 +2895,14 @@ static void display_wake(void)
  */
 static void display_sleep_if_idle(TickType_t timeout)
 {
-  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  display_lock();
   if (display_on && !reset_screen_shown && xTaskGetTickCount() - last_activity_tick >= timeout)
   {
     display_on = false;
-    gpio_set_level((gpio_num_t)LCD_BL_PIN, 0);
+    lcd_backlight(false);
     ESP_LOGI(TAG_MAIN, "Screen off (press G0 to wake)");
   }
-  xSemaphoreGiveRecursive(display_mutex);
+  display_unlock();
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -3460,7 +2914,7 @@ static void display_sleep_if_idle(TickType_t timeout)
  */
 static void draw_reset_screen(const char *line1, const char *line2)
 {
-  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  display_lock();
   reset_screen_shown = true;
   display_on = true;
   lcd_fill_screen(THEME_BG);
@@ -3469,8 +2923,8 @@ static void draw_reset_screen(const char *line1, const char *line2)
   lcd_draw_string(8, 50, line1, THEME_TEXT, THEME_BG);
   lcd_draw_string(8, 70, line2, THEME_DIM, THEME_BG);
   lcd_flush();
-  gpio_set_level((gpio_num_t)LCD_BL_PIN, 1);
-  xSemaphoreGiveRecursive(display_mutex);
+  lcd_backlight(true);
+  display_unlock();
 }
 
 /**
@@ -3483,7 +2937,7 @@ static void factory_reset(void)
   draw_reset_screen("Settings erased", "Release G0 to restart");
 
   // G0 is a strapping pin: restarting while it is held would enter download mode
-  while (gpio_get_level((gpio_num_t)BUTTON_G0_PIN) == 0)
+  while (button_g0_pressed())
     vTaskDelay(pdMS_TO_TICKS(50));
   esp_restart();
 }
@@ -3546,102 +3000,6 @@ static void toggle_eco_mode(void)
   stored_config.eco_mode = !stored_config.eco_mode;
   apply_eco_mode(stored_config.eco_mode);
   save_setting_u8(NVS_KEY_ECO_MODE, stored_config.eco_mode ? 1 : 0);
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * KEYBOARD (Cardputer ADV)
- * ═══════════════════════════════════════════════════════════════════ */
-
-static i2c_master_dev_handle_t keyboard_dev = NULL;
-
-static esp_err_t tca8418_write(uint8_t reg, uint8_t value)
-{
-  uint8_t buf[2] = {reg, value};
-  return i2c_master_transmit(keyboard_dev, buf, sizeof(buf), 50);
-}
-
-static esp_err_t tca8418_read(uint8_t reg, uint8_t *value)
-{
-  return i2c_master_transmit_receive(keyboard_dev, &reg, 1, value, 1, 50);
-}
-
-/**
- * Set up the TCA8418 as a 7x8 key matrix (like the M5Cardputer library).
- * Key events are polled, the interrupt pin is not used.
- */
-static bool keyboard_init(void)
-{
-  i2c_master_bus_config_t bus_config = {};
-  bus_config.i2c_port = -1; // any free controller
-  bus_config.sda_io_num = (gpio_num_t)KEYBOARD_SDA_PIN;
-  bus_config.scl_io_num = (gpio_num_t)KEYBOARD_SCL_PIN;
-  bus_config.clk_source = I2C_CLK_SRC_DEFAULT;
-  bus_config.glitch_ignore_cnt = 7;
-  bus_config.flags.enable_internal_pullup = true;
-
-  i2c_master_bus_handle_t bus = NULL;
-  if (i2c_new_master_bus(&bus_config, &bus) != ESP_OK)
-    return false;
-  if (i2c_master_probe(bus, TCA8418_ADDR, 50) != ESP_OK)
-  {
-    ESP_LOGW(TAG_MAIN, "Keyboard: no TCA8418 found (not a Cardputer ADV?) - V key disabled");
-    i2c_del_master_bus(bus);
-    return false;
-  }
-
-  i2c_device_config_t dev_config = {};
-  dev_config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-  dev_config.device_address = TCA8418_ADDR;
-  dev_config.scl_speed_hz = 400000;
-  if (i2c_master_bus_add_device(bus, &dev_config, &keyboard_dev) != ESP_OK)
-    return false;
-
-  tca8418_write(TCA8418_REG_KP_GPIO_1, 0x7F); // rows 0-6
-  tca8418_write(TCA8418_REG_KP_GPIO_2, 0xFF); // columns 0-7
-  tca8418_write(TCA8418_REG_KP_GPIO_3, 0x00);
-  tca8418_write(TCA8418_REG_CFG, 0x01);       // key event interrupt (KE_IEN)
-
-  // Drop events from before the start
-  uint8_t event = 0;
-  for (int i = 0; i < 10 && tca8418_read(TCA8418_REG_KEY_EVENT_A, &event) == ESP_OK && event != 0; i++)
-  {
-  }
-  tca8418_write(TCA8418_REG_INT_STAT, 0x03);
-  ESP_LOGI(TAG_MAIN, "✓ Keyboard ready (?: help, W: WiFi menu, Q: QR code, V: VPN, P: transmit power, E: eco mode)");
-  return true;
-}
-
-/**
- * Read the keyboard FIFO: key codes of the keys pressed since the last call
- * (with shift / fn applied, the modifiers themselves are not returned).
- * Returns the number of codes stored in codes.
- */
-static int keyboard_read_keys(uint8_t *codes, int max_codes)
-{
-  static bool shift = false, fn = false;
-  if (!keyboard_dev)
-    return 0;
-  uint8_t count = 0;
-  if (tca8418_read(TCA8418_REG_KEY_LCK_EC, &count) != ESP_OK || (count & 0x0F) == 0)
-    return 0;
-
-  int stored = 0;
-  for (int i = 0; i < (count & 0x0F); i++)
-  {
-    uint8_t event = 0;
-    if (tca8418_read(TCA8418_REG_KEY_EVENT_A, &event) != ESP_OK || event == 0)
-      break;
-    bool pressed = event & TCA8418_KEY_PRESSED;
-    uint8_t code = keyboard_key_code(event & 0x7F, false, false);
-    if (code == KC_SHIFT)
-      shift = pressed;
-    else if (code == KC_FN)
-      fn = pressed;
-    else if (pressed && stored < max_codes)
-      codes[stored++] = keyboard_key_code(event & 0x7F, shift, fn);
-  }
-  tca8418_write(TCA8418_REG_INT_STAT, 0x01);
-  return stored;
 }
 
 static bool wg_configured(void)
@@ -3823,7 +3181,7 @@ static void wifi_menu_scan(void)
   esp_err_t err = ESP_OK;
   wifi_ap_record_t *records = scan_networks(&count, &err);
 
-  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  display_lock();
   if (wifi_menu.screen == MENU_SCANNING) // not cancelled meanwhile
   {
     for (int i = 0; records && i < count; i++)
@@ -3837,7 +3195,7 @@ static void wifi_menu_scan(void)
     }
     wifi_menu_scan_done(&wifi_menu);
   }
-  xSemaphoreGiveRecursive(display_mutex);
+  display_unlock();
   if (!records)
     ESP_LOGW(TAG_MAIN, "WiFi menu: scan failed: %s", esp_err_to_name(err));
   free(records);
@@ -3885,9 +3243,9 @@ static void wifi_menu_connect(void)
 /* A key while the menu is open */
 static void wifi_menu_handle_key(uint8_t code)
 {
-  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  display_lock();
   menu_action_t action = wifi_menu_key(&wifi_menu, code);
-  xSemaphoreGiveRecursive(display_mutex);
+  display_unlock();
 
   if (action == MENU_ACT_SCAN)
     wifi_menu_scan();
@@ -3899,24 +3257,20 @@ static void wifi_menu_handle_key(uint8_t code)
 
 static void ui_task(void *pvParameters)
 {
-  gpio_config_t button_config = {};
-  button_config.pin_bit_mask = 1ULL << BUTTON_G0_PIN;
-  button_config.mode = GPIO_MODE_INPUT;
-  button_config.pull_up_en = GPIO_PULLUP_ENABLE;
-  gpio_config(&button_config);
+  button_g0_init();
 
   bool was_pressed = false;
   TickType_t pressed_since = 0;
   int countdown_shown = -1;
   TickType_t last_battery_tick = xTaskGetTickCount();
   last_activity_tick = xTaskGetTickCount();
-  if (!config_mode)
-    keyboard_init();
+  if (!config_mode && keyboard_init())
+    ESP_LOGI(TAG_MAIN, "✓ Keyboard ready (?: help, W: WiFi menu, Q: QR code, V: VPN, P: transmit power, E: eco mode)");
 
   while (1)
   {
     TickType_t now = xTaskGetTickCount();
-    bool pressed = gpio_get_level((gpio_num_t)BUTTON_G0_PIN) == 0;
+    bool pressed = button_g0_pressed();
 
     if (pressed && !was_pressed)
     {
@@ -3995,9 +3349,9 @@ static void ui_task(void *pvParameters)
       else if (code == 'w' || code == 'W')
       {
         // WiFi menu: pick the uplink network
-        xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+        display_lock();
         wifi_menu_open(&wifi_menu);
-        xSemaphoreGiveRecursive(display_mutex);
+        display_unlock();
         display_wake();
         wifi_menu_scan();
       }

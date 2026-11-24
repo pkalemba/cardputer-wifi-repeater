@@ -1,0 +1,7 @@
+{
+  "name": "cardputer",
+  "version": "1.0.0",
+  "description": "Shared M5Stack Cardputer code for the apps in apps/: ST7789 display with an 8x8 font and the Gruvbox theme, battery gauge, ADV keyboard (TCA8418), QR codes",
+  "frameworks": "espidf",
+  "platforms": "espressif32"
+}

@@ -1,7 +1,11 @@
 /*
- * Host unit tests for the hardware independent parts of the firmware:
- * src/netutil.cpp and src/wifi_menu.cpp. Run with `make -C test/host`.
+ * Host unit tests for the hardware independent parts of the apps:
+ * the WiFi repeater (netutil, wifi_menu), the shared keyboard map and QR
+ * code generator, the tracker detector (test_trackers.cpp) and the room
+ * scanner (test_roomscan.cpp). Run with `make -C test/host`.
  */
+
+#include "test.h"
 
 #include "netutil.h"
 #include "qrcodegen/qrcodegen.h"
@@ -11,51 +15,8 @@
 #include <stdio.h>
 #include <string.h>
 
-static int checks = 0;
-static int failures = 0;
-
-#define CHECK(cond)                                                       \
-  do                                                                      \
-  {                                                                       \
-    checks++;                                                             \
-    if (!(cond))                                                          \
-    {                                                                     \
-      failures++;                                                         \
-      printf("  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);            \
-    }                                                                     \
-  } while (0)
-
-#define CHECK_EQ(a, b)                                                                              \
-  do                                                                                                \
-  {                                                                                                 \
-    checks++;                                                                                       \
-    long long va = (long long)(a), vb = (long long)(b);                                             \
-    if (va != vb)                                                                                   \
-    {                                                                                               \
-      failures++;                                                                                   \
-      printf("  FAIL %s:%d: %s == %s (%lld != %lld)\n", __FILE__, __LINE__, #a, #b, va, vb);       \
-    }                                                                                               \
-  } while (0)
-
-#define CHECK_STR(a, b)                                                                         \
-  do                                                                                            \
-  {                                                                                             \
-    checks++;                                                                                   \
-    if (strcmp((a), (b)) != 0)                                                                  \
-    {                                                                                           \
-      failures++;                                                                               \
-      printf("  FAIL %s:%d: %s == \"%s\" (got \"%s\")\n", __FILE__, __LINE__, #a, (b), (a));  \
-    }                                                                                           \
-  } while (0)
-
-#define TEST(name) static void name(void)
-#define RUN(name)              \
-  do                           \
-  {                            \
-    int before = failures;     \
-    name();                    \
-    printf("%s %s\n", failures == before ? "ok  " : "FAIL", #name); \
-  } while (0)
+int checks = 0;
+int failures = 0;
 
 static uint32_t ip(const char *text) { return inet_addr(text); }
 
@@ -868,6 +829,8 @@ int main(void)
   RUN(test_wg_import_full);
   RUN(test_wg_import_split);
   RUN(test_wg_import_errors);
+  run_tracker_tests();
+  run_roomscan_tests();
   printf("\n%d checks, %d failed\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }
