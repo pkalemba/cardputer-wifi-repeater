@@ -130,6 +130,13 @@ After configuration:
 
 ### Keyboard (Cardputer ADV)
 
+- **W**: WiFi menu - pick the uplink network on the device, no phone needed:
+  - the list shows the networks in range: `*` = password needed, `+` = already saved, `<` = current
+  - `;` / `.` move (the arrow keys), **Enter** joins, **R** scans again, **fn + `** goes back
+  - a secured network that is not saved asks for its password (Shift for capitals and
+    symbols, Del erases); **P** on a saved network types a new password
+  - the chosen network is saved as the main network (the previous one stays in the
+    saved networks) and the repeater connects to it right away
 - **V**: switches the WireGuard VPN on or off (remembered across restarts, same as the
   checkbox in the web UI). The display shows `VPN:OFF` while it is configured but off.
   WireGuard has to be set up in the web UI first.
@@ -229,6 +236,16 @@ pio run -t upload
 
 # Monitor serial output
 pio device monitor
+```
+
+### Unit tests
+
+The hardware independent code (`src/netutil.cpp`: form decoding, address/DNS parsing, TCP MSS
+clamping, saved networks; `src/wifi_menu.cpp`: key map and WiFi menu) has host unit tests,
+built with AddressSanitizer and UndefinedBehaviorSanitizer. CI runs them on every push:
+
+```bash
+make -C test/host
 ```
 
 Besides `firmware.bin`, every build writes `.pio/build/m5stack-stamps3/factory.bin`:

@@ -53,7 +53,8 @@
 
 // WireGuard
 #include "esp_wireguard.h"
-#include "netutil.h" // pure helpers, unit tested on the host (test/host)
+#include "netutil.h"   // pure helpers, unit tested on the host (test/host)
+#include "wifi_menu.h" // on-device WiFi menu and key map, unit tested on the host
 #include "wireguard.h" // peer state for the debug page (library pinned in platformio.ini)
 
 // Battery (ADC) includes
@@ -393,6 +394,8 @@ static bool wg_connected = false;
 static bool wg_peer_up = false;
 static char wg_status[96] = "disabled";
 static volatile bool wg_toggle_requested = false; // V key, handled in the status task
+static wifi_menu_t wifi_menu = {};                 // W key; MENU_CLOSED, changed in the UI task under display_mutex
+static void draw_menu_screen(void);
 static bool wg_configured(void);
 static int64_t wg_connect_us = 0; // when the tunnel was started
 
@@ -488,11 +491,7 @@ static TaskHandle_t status_task_handle = NULL;
 #define TCA8418_REG_KP_GPIO_2 0x1E
 #define TCA8418_REG_KP_GPIO_3 0x1F
 #define TCA8418_KEY_PRESSED 0x80
-/* Key numbers are row * 10 + column + 1 of the 7x8 matrix (layout as in the
- * M5Cardputer library): V is in the bottom row, 7th key -> matrix row 3, column 3 */
-#define KEY_V 34 // VPN on/off
-#define KEY_E 16 // eco mode on/off (2nd row, 4th key)
-#define KEY_P 52 // next transmit power (2nd row, 11th key)
+/* Key numbers -> characters: keyboard_key_code() in wifi_menu.cpp */
 
 /* M5Stack Cardputer G0 button and battery */
 #define BUTTON_G0_PIN 0            // active low; also a strapping pin (download mode at reset)
@@ -1598,8 +1597,16 @@ static void schedule_reconnect(void)
  */
 static volatile bool uplink_scan_pending = false;
 
+static volatile bool uplink_choice_pending;
+
 static esp_err_t start_uplink_connect(void)
 {
+  // Network picked in the WiFi menu: connect to it, no scan for the strongest one
+  if (uplink_choice_pending)
+  {
+    uplink_choice_pending = false;
+    return esp_wifi_connect();
+  }
   if (saved_network_count() > 1)
   {
     wifi_scan_config_t scan_config = {};
@@ -3081,6 +3088,8 @@ static void display_update_status(void)
   {
     if (config_mode)
       draw_setup_screen();
+    else if (wifi_menu.screen != MENU_CLOSED)
+      draw_menu_screen();
     else
       draw_status_screen();
     lcd_flush();
@@ -3275,32 +3284,41 @@ static bool keyboard_init(void)
   {
   }
   tca8418_write(TCA8418_REG_INT_STAT, 0x03);
-  ESP_LOGI(TAG_MAIN, "✓ Keyboard ready (V: VPN, P: transmit power, E: eco mode)");
+  ESP_LOGI(TAG_MAIN, "✓ Keyboard ready (W: WiFi menu, V: VPN, P: transmit power, E: eco mode)");
   return true;
 }
 
 /**
- * Next key press from the keyboard FIFO (key number), 0 when none
+ * Read the keyboard FIFO: key codes of the keys pressed since the last call
+ * (with shift / fn applied, the modifiers themselves are not returned).
+ * Returns the number of codes stored in codes.
  */
-static uint8_t keyboard_read_press(void)
+static int keyboard_read_keys(uint8_t *codes, int max_codes)
 {
+  static bool shift = false, fn = false;
   if (!keyboard_dev)
     return 0;
   uint8_t count = 0;
   if (tca8418_read(TCA8418_REG_KEY_LCK_EC, &count) != ESP_OK || (count & 0x0F) == 0)
     return 0;
 
-  uint8_t pressed = 0;
+  int stored = 0;
   for (int i = 0; i < (count & 0x0F); i++)
   {
     uint8_t event = 0;
     if (tca8418_read(TCA8418_REG_KEY_EVENT_A, &event) != ESP_OK || event == 0)
       break;
-    if ((event & TCA8418_KEY_PRESSED) && pressed == 0)
-      pressed = event & 0x7F;
+    bool pressed = event & TCA8418_KEY_PRESSED;
+    uint8_t code = keyboard_key_code(event & 0x7F, false, false);
+    if (code == KC_SHIFT)
+      shift = pressed;
+    else if (code == KC_FN)
+      fn = pressed;
+    else if (pressed && stored < max_codes)
+      codes[stored++] = keyboard_key_code(event & 0x7F, shift, fn);
   }
   tca8418_write(TCA8418_REG_INT_STAT, 0x01);
-  return pressed;
+  return stored;
 }
 
 static bool wg_configured(void)
@@ -3308,6 +3326,164 @@ static bool wg_configured(void)
   return strlen(stored_config.wg_private_key) == WG_KEY_B64_LEN &&
          strlen(stored_config.wg_peer_public_key) == WG_KEY_B64_LEN &&
          strlen(stored_config.wg_endpoint) > 0 && strlen(stored_config.wg_address) > 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * WIFI MENU ON THE DISPLAY (W key)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+// uplink_choice_pending (declared with start_uplink_connect): connect to active_network once, without a scan
+
+static void draw_menu_screen(void)
+{
+  lcd_fill_screen(TERM_BG);
+  lcd_fill_rect(0, 0, 240, 16, TERM_GREEN_DARK);
+
+  if (wifi_menu.screen == MENU_SCANNING)
+  {
+    lcd_draw_string(84, 4, "WIFI MENU", TERM_GREEN, TERM_GREEN_DARK);
+    lcd_draw_string(8, 56, "Scanning for networks...", TERM_ACCENT, TERM_BG);
+    lcd_draw_string(8, 122, "fn+`: cancel", TERM_GREEN_DIM, TERM_BG);
+    return;
+  }
+
+  if (wifi_menu.screen == MENU_LIST)
+  {
+    char title[32];
+    snprintf(title, sizeof(title), "WIFI MENU  %d networks", wifi_menu.count);
+    lcd_draw_string(8, 4, title, TERM_GREEN, TERM_GREEN_DARK);
+    if (wifi_menu.count == 0)
+      lcd_draw_string(8, 40, "No networks found", TERM_ACCENT, TERM_BG);
+
+    for (int row = 0; row < MENU_VISIBLE_ROWS; row++)
+    {
+      int i = wifi_menu.scroll + row;
+      if (i >= wifi_menu.count)
+        break;
+      const menu_network_t *n = &wifi_menu.networks[i];
+      int y = 20 + row * 14;
+      bool selected = i == wifi_menu.selected;
+      uint16_t bg = selected ? TERM_GREEN_DARK : TERM_BG;
+      if (selected)
+        lcd_fill_rect(0, y - 2, 240, 13, bg);
+      char line[32];
+      // '*' secured, '+' saved; name cut to fit, signal on the right
+      snprintf(line, sizeof(line), "%c%c%-19.19s %4d", n->saved ? '+' : ' ', n->secured ? '*' : ' ', n->ssid,
+               n->rssi);
+      lcd_draw_string(4, y, line, selected ? TERM_GREEN : TERM_ACCENT, bg);
+      if (strcmp(n->ssid, network_ssid(active_network)) == 0 && sta_connected)
+        lcd_draw_string(224, y, "<", TERM_GREEN, bg);
+    }
+    lcd_draw_string(4, 122, "Ent:join ;.:move R:scan fn+`", TERM_GREEN_DIM, TERM_BG);
+    return;
+  }
+
+  if (wifi_menu.screen == MENU_PASSWORD)
+  {
+    const menu_network_t *n = wifi_menu_selected(&wifi_menu);
+    lcd_draw_string(8, 4, "PASSWORD", TERM_GREEN, TERM_GREEN_DARK);
+    lcd_draw_string(8, 24, n ? n->ssid : "", TERM_ACCENT, TERM_BG);
+
+    // Input box: the last 27 characters, cursor at the end
+    lcd_fill_rect(4, 44, 232, 1, TERM_GREEN_DIM);
+    lcd_fill_rect(4, 62, 232, 1, TERM_GREEN_DIM);
+    char shown[29];
+    const char *text = wifi_menu.password;
+    int len = wifi_menu.password_len;
+    snprintf(shown, sizeof(shown), "%.27s_", len > 27 ? text + len - 27 : text);
+    lcd_draw_string(8, 50, shown, TERM_GREEN, TERM_BG);
+
+    char info[32];
+    if (len < MENU_PASSWORD_MIN)
+      snprintf(info, sizeof(info), "%d characters (min %d)", len, MENU_PASSWORD_MIN);
+    else
+      snprintf(info, sizeof(info), "%d characters", len);
+    lcd_draw_string(8, 72, info, len < MENU_PASSWORD_MIN ? TERM_ACCENT : TERM_GREEN_DIM, TERM_BG);
+    lcd_draw_string(8, 108, "Shift: capitals/symbols", TERM_GREEN_DIM, TERM_BG);
+    lcd_draw_string(8, 122, "Ent:connect Del:erase fn+`", TERM_GREEN_DIM, TERM_BG);
+  }
+}
+
+/* Scan for the menu (UI task - blocks for a few seconds) */
+static void wifi_menu_scan(void)
+{
+  display_update_status(); // "Scanning..."
+  uint16_t count = 0;
+  esp_err_t err = ESP_OK;
+  wifi_ap_record_t *records = scan_networks(&count, &err);
+
+  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  if (wifi_menu.screen == MENU_SCANNING) // not cancelled meanwhile
+  {
+    for (int i = 0; records && i < count; i++)
+    {
+      const char *ssid = (const char *)records[i].ssid;
+      bool saved = false;
+      for (int n = 0; n < UPLINK_NETWORKS && !saved; n++)
+        saved = network_ssid(n)[0] != '\0' && strcmp(network_ssid(n), ssid) == 0;
+      bool secured = records[i].authmode != WIFI_AUTH_OPEN && records[i].authmode != WIFI_AUTH_OWE;
+      wifi_menu_add_network(&wifi_menu, ssid, records[i].rssi, secured, saved);
+    }
+    wifi_menu_scan_done(&wifi_menu);
+  }
+  xSemaphoreGiveRecursive(display_mutex);
+  if (!records)
+    ESP_LOGW(TAG_MAIN, "WiFi menu: scan failed: %s", esp_err_to_name(err));
+  free(records);
+}
+
+/*
+ * Join the network picked in the menu: save it (it becomes the main
+ * network unless it is already saved) and reconnect to it right away
+ */
+static void wifi_menu_connect(void)
+{
+  const menu_network_t *n = wifi_menu_selected(&wifi_menu);
+  if (!n)
+    return;
+
+  char *ssids[UPLINK_NETWORKS] = {stored_config.sta_ssid};
+  char *passwords[UPLINK_NETWORKS] = {stored_config.sta_password};
+  for (int i = 1; i < UPLINK_NETWORKS; i++)
+  {
+    ssids[i] = stored_config.extra_ssid[i - 1];
+    passwords[i] = stored_config.extra_password[i - 1];
+  }
+  // Same buffer sizes for the main and the extra networks
+  int slot = remember_network(ssids, passwords, UPLINK_NETWORKS, sizeof(stored_config.sta_ssid),
+                              sizeof(stored_config.sta_password), n->ssid,
+                              wifi_menu.password_entered ? wifi_menu.password : NULL);
+  memset(wifi_menu.password, 0, sizeof(wifi_menu.password));
+  wifi_menu.password_len = 0;
+
+  save_wifi_config(&stored_config);
+  ESP_LOGI(TAG_STA, "WiFi menu: connecting to \"%s\"", network_ssid(slot));
+
+  active_network = slot;
+  sta_open_fallback = false;
+  last_disconnect_reason = 0;
+  uplink_choice_pending = true;
+  apply_sta_config(false);
+  reconnect_delay_ms = WIFI_RECONNECT_MIN_MS;
+  if (sta_connected)
+    esp_wifi_disconnect(); // the disconnect event schedules the reconnect
+  else
+    schedule_reconnect();
+}
+
+/* A key while the menu is open */
+static void wifi_menu_handle_key(uint8_t code)
+{
+  xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+  menu_action_t action = wifi_menu_key(&wifi_menu, code);
+  xSemaphoreGiveRecursive(display_mutex);
+
+  if (action == MENU_ACT_SCAN)
+    wifi_menu_scan();
+  else if (action == MENU_ACT_CONNECT)
+    wifi_menu_connect();
+  if (action != MENU_ACT_NONE)
+    display_wake();
 }
 
 static void ui_task(void *pvParameters)
@@ -3364,29 +3540,45 @@ static void ui_task(void *pvParameters)
     }
     was_pressed = pressed;
 
-    // V: switch the VPN on/off (done in the status task, next to the tunnel updates)
-    uint8_t key = keyboard_read_press();
-    if (key == KEY_V && status_task_handle)
+    uint8_t keys[8];
+    int key_count = keyboard_read_keys(keys, sizeof(keys));
+    for (int k = 0; k < key_count; k++)
     {
-      wg_toggle_requested = true;
-      xTaskNotifyGive(status_task_handle);
+      uint8_t code = keys[k];
+      if (wifi_menu.screen != MENU_CLOSED)
+      {
+        wifi_menu_handle_key(code);
+        continue;
+      }
+      if ((code == 'v' || code == 'V') && status_task_handle)
+      {
+        // VPN on/off (done in the status task, next to the tunnel updates)
+        wg_toggle_requested = true;
+        xTaskNotifyGive(status_task_handle);
+      }
+      else if (code == 'p' || code == 'P')
+      {
+        cycle_tx_power();
+      }
+      else if (code == 'e' || code == 'E')
+      {
+        toggle_eco_mode();
+      }
+      else if (code == 'w' || code == 'W')
+      {
+        // WiFi menu: pick the uplink network
+        xSemaphoreTakeRecursive(display_mutex, portMAX_DELAY);
+        wifi_menu_open(&wifi_menu);
+        xSemaphoreGiveRecursive(display_mutex);
+        display_wake();
+        wifi_menu_scan();
+      }
       display_wake();
     }
-    else if (key == KEY_P)
-    {
-      cycle_tx_power();
-      display_wake();
-    }
-    else if (key == KEY_E)
-    {
-      toggle_eco_mode();
-      display_wake();
-    }
-    else if (key != 0)
-    {
-      ESP_LOGD(TAG_MAIN, "Key %u pressed", key);
-      display_wake();
-    }
+
+    // The menu closes when the screen turns off
+    if (!display_on && wifi_menu.screen != MENU_CLOSED)
+      wifi_menu.screen = MENU_CLOSED;
 
     // Screen timeout (the screen stays on in setup mode)
     if (!config_mode && stored_config.display_timeout > 0 && !pressed)
