@@ -4,7 +4,8 @@ Check that a firmware build fits the M5Stack Cardputer (ESP32-S3FN8: 8 MB flash,
 no PSRAM, 512 KB internal RAM).
 
     pip install esp-idf-size        # for the RAM check
-    python scripts/check_fit.py [BUILD_DIR] [--sdkconfig FILE]
+    cd apps/<app> && pio run
+    python ../../scripts/check_fit.py [BUILD_DIR] [--sdkconfig FILE]
 
 Exits with 1 when something does not fit and warns when it gets close. In GitHub
 Actions the results also go to the job summary and show up as annotations.
@@ -126,7 +127,8 @@ class Report:
 
 def main():
     parser = argparse.ArgumentParser(description='Check that the firmware fits the M5Stack Cardputer.')
-    parser.add_argument('build_dir', nargs='?', default='.pio/build/m5stack-stamps3')
+    parser.add_argument('build_dir', nargs='?', default='.pio/build/m5stack-stamps3',
+                        help='build folder (default: the one of the app in the current folder)')
     parser.add_argument('--sdkconfig', default='sdkconfig.m5stack-stamps3')
     parser.add_argument('--require-ram', action='store_true',
                         help='fail instead of warn when the RAM usage cannot be determined')
