@@ -123,6 +123,8 @@ typedef struct
 {
   char sta_ssid[32];
   char sta_password[64];
+  char extra_ssid[4][32]; // more uplink networks, the strongest one in range is used
+  char extra_password[4][64];
   char ap_ssid[32];
   char ap_password[64];
   bool configured;
@@ -148,6 +150,29 @@ typedef struct
 } repeater_config_t;
 
 static repeater_config_t stored_config = {0};
+
+/* Saved uplink networks: 0 = main network, 1-4 = extra networks */
+#define UPLINK_NETWORKS 5
+static int active_network = 0; // the one being connected / connected to
+
+static const char *network_ssid(int i)
+{
+  return i == 0 ? stored_config.sta_ssid : stored_config.extra_ssid[i - 1];
+}
+
+static const char *network_password(int i)
+{
+  return i == 0 ? stored_config.sta_password : stored_config.extra_password[i - 1];
+}
+
+static int saved_network_count(void)
+{
+  int count = 0;
+  for (int i = 0; i < UPLINK_NETWORKS; i++)
+    if (network_ssid(i)[0] != '\0')
+      count++;
+  return count;
+}
 
 /* FreeRTOS event group to signal when we are connected */
 #define WIFI_CONNECTED_BIT BIT0
@@ -319,6 +344,7 @@ static const struct
 
 #define CHECK_INTERVAL_ONLINE_MS 60000 // while online; every status cycle (10 s) otherwise
 #define PORTAL_FALLBACK_URL "http://neverssl.com/"
+#define FORM_BODY_MAX 3072 // URL encoded settings form
 
 /* Status tracking */
 static bool sta_connected = false;
@@ -649,6 +675,7 @@ static const char *html_page_head =
 
 static const char *html_page_script =
     "<script>"
+    "var target=null;"
     "function scan(){"
     "var n=document.getElementById('nets');n.textContent='Scanning...';"
     "fetch('/scan').then(function(r){if(!r.ok)throw r.status;return r.json()}).then(function(l){"
@@ -656,8 +683,9 @@ static const char *html_page_script =
     "if(!l.length){n.textContent='No networks found';return}"
     "l.forEach(function(a){var d=document.createElement('div');d.className='net';"
     "d.textContent=(a.auth?'\\uD83D\\uDD12 ':'')+a.ssid+'  ('+a.rssi+' dBm, ch '+a.ch+')';"
-    "d.onclick=function(){document.getElementById('sta_ssid').value=a.ssid;"
-    "if(!a.auth)document.getElementById('sta_pass').value='-';n.textContent=''};"
+    "d.onclick=function(){var s=target||document.getElementById('sta_ssid');s.value=a.ssid;"
+    "var p=document.getElementById(s.id=='sta_ssid'?'sta_pass':s.id.replace('ssid','pass'));"
+    "if(p&&!a.auth)p.value='-';n.textContent=''};"
     "n.appendChild(d)})"
     "}).catch(function(e){n.textContent='Scan failed ('+e+') - uplink may be busy connecting, try again'})}"
     "</script>";
@@ -767,7 +795,7 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "<div class='section'>"
                            "<h2 style='color:#4CAF50;margin-top:0'>Uplink WiFi</h2>"
                            "<label>Network Name (SSID):</label>"
-                           "<div class='row'><input type='text' id='sta_ssid' name='sta_ssid' value='");
+                           "<div class='row'><input type='text' id='sta_ssid' name='sta_ssid' onfocus='target=this' value='");
   send_html_escaped(req, config->sta_ssid);
   httpd_resp_sendstr_chunk(req,
                            "' placeholder='Your WiFi network name' required>"
@@ -777,8 +805,24 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "<input type='password' id='sta_pass' name='sta_pass' placeholder='");
   httpd_resp_sendstr_chunk(req, strlen(config->sta_password) > 0 ? "Blank keeps current, - removes it (open network)"
                                                                   : "Leave empty for an open network");
+  httpd_resp_sendstr_chunk(req, "'><label>Other saved networks (the strongest one in range is used):</label>");
+  for (int i = 0; i < 4; i++)
+  {
+    char field[160];
+    snprintf(field, sizeof(field),
+             "<div class='row'><input type='text' id='ssid%d' name='ssid%d' onfocus='target=this' "
+             "placeholder='Network name' value='",
+             i + 2, i + 2);
+    httpd_resp_sendstr_chunk(req, field);
+    send_html_escaped(req, config->extra_ssid[i]);
+    snprintf(field, sizeof(field), "'><input type='password' id='pass%d' name='pass%d' placeholder='%s'></div>", i + 2,
+             i + 2, strlen(config->extra_password[i]) > 0 ? "Blank keeps, - removes" : "Password");
+    httpd_resp_sendstr_chunk(req, field);
+  }
   httpd_resp_sendstr_chunk(req,
-                           "'></div>"
+                           "<div class='info'>Click a field, then a network from the scan to fill it in. "
+                           "Empty name removes a network.</div>"
+                           "</div>"
                            "<div class='section'>"
                            "<h2 style='color:#4CAF50;margin-top:0'>Access Point</h2>"
                            "<label>AP Name (SSID):</label>"
@@ -1296,6 +1340,14 @@ static esp_err_t save_wifi_config(const repeater_config_t *config)
   nvs_set_u8(nvs_handle, NVS_KEY_CONFIGURED, 1);
   nvs_set_str(nvs_handle, NVS_KEY_STA_SSID, config->sta_ssid);
   nvs_set_str(nvs_handle, NVS_KEY_STA_PASS, config->sta_password);
+  for (int i = 0; i < 4; i++)
+  {
+    char key[16];
+    snprintf(key, sizeof(key), "sta_ssid%d", i + 2);
+    nvs_set_str(nvs_handle, key, config->extra_ssid[i]);
+    snprintf(key, sizeof(key), "sta_pass%d", i + 2);
+    nvs_set_str(nvs_handle, key, config->extra_password[i]);
+  }
   nvs_set_str(nvs_handle, NVS_KEY_AP_SSID, config->ap_ssid);
   nvs_set_str(nvs_handle, NVS_KEY_AP_PASS, config->ap_password);
 
@@ -1356,6 +1408,18 @@ static esp_err_t load_wifi_config(repeater_config_t *config)
 
   len = sizeof(config->sta_password);
   nvs_get_str(nvs_handle, NVS_KEY_STA_PASS, config->sta_password, &len);
+
+  // More uplink networks (absent in configs saved by older firmware)
+  for (int i = 0; i < 4; i++)
+  {
+    char key[16];
+    snprintf(key, sizeof(key), "sta_ssid%d", i + 2);
+    len = sizeof(config->extra_ssid[i]);
+    nvs_get_str(nvs_handle, key, config->extra_ssid[i], &len);
+    snprintf(key, sizeof(key), "sta_pass%d", i + 2);
+    len = sizeof(config->extra_password[i]);
+    nvs_get_str(nvs_handle, key, config->extra_password[i], &len);
+  }
 
   len = sizeof(config->ap_ssid);
   nvs_get_str(nvs_handle, NVS_KEY_AP_SSID, config->ap_ssid, &len);
@@ -1445,11 +1509,13 @@ static esp_err_t clear_wifi_config(void)
  */
 static esp_err_t apply_sta_config(bool open)
 {
+  const char *ssid = network_ssid(active_network);
+  const char *password = network_password(active_network);
   wifi_config_t wifi_sta_config = {};
-  memcpy(wifi_sta_config.sta.ssid, stored_config.sta_ssid, strlen(stored_config.sta_ssid));
-  bool use_password = !open && strlen(stored_config.sta_password) > 0;
+  memcpy(wifi_sta_config.sta.ssid, ssid, strlen(ssid));
+  bool use_password = !open && strlen(password) > 0;
   if (use_password)
-    memcpy(wifi_sta_config.sta.password, stored_config.sta_password, strlen(stored_config.sta_password));
+    memcpy(wifi_sta_config.sta.password, password, strlen(password));
   wifi_sta_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
   wifi_sta_config.sta.failure_retry_cnt = WIFI_STA_DRIVER_RETRIES;
   wifi_sta_config.sta.threshold.authmode = use_password ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
@@ -1473,9 +1539,72 @@ static void schedule_reconnect(void)
   reconnect_delay_ms = reconnect_delay_ms * 2 > WIFI_RECONNECT_MAX_MS ? WIFI_RECONNECT_MAX_MS : reconnect_delay_ms * 2;
 }
 
+/*
+ * With several saved networks a scan picks the strongest one in range
+ * (WIFI_EVENT_SCAN_DONE in the event handler), otherwise connect directly
+ */
+static volatile bool uplink_scan_pending = false;
+
+static esp_err_t start_uplink_connect(void)
+{
+  if (saved_network_count() > 1)
+  {
+    wifi_scan_config_t scan_config = {};
+    uplink_scan_pending = true;
+    if (esp_wifi_scan_start(&scan_config, false) == ESP_OK)
+      return ESP_OK;
+    uplink_scan_pending = false; // e.g. a scan from the web panel is running - try the current network
+  }
+  return esp_wifi_connect();
+}
+
+/* Scan done: switch to the strongest saved network (records are sorted by RSSI) */
+static void uplink_scan_done(void)
+{
+  uint16_t count = 20;
+  wifi_ap_record_t *records = (wifi_ap_record_t *)calloc(count, sizeof(wifi_ap_record_t));
+  int best = -1;
+  int best_rssi = 0;
+  if (records && esp_wifi_scan_get_ap_records(&count, records) == ESP_OK)
+  {
+    for (int r = 0; r < count && best < 0; r++)
+      for (int i = 0; i < UPLINK_NETWORKS && best < 0; i++)
+        if (network_ssid(i)[0] != '\0' && strcmp((const char *)records[r].ssid, network_ssid(i)) == 0)
+        {
+          best = i;
+          best_rssi = records[r].rssi;
+        }
+  }
+  else
+  {
+    esp_wifi_clear_ap_list();
+  }
+  free(records);
+
+  if (best < 0)
+  {
+    // Not in range, or a hidden network - try the current one (directed probe)
+    ESP_LOGW(TAG_STA, "Uplink: no saved network found by the scan, trying \"%s\"", network_ssid(active_network));
+  }
+  else if (best != active_network)
+  {
+    ESP_LOGI(TAG_STA, "Uplink: picked \"%s\" (%d dBm)", network_ssid(best), best_rssi);
+    active_network = best;
+    sta_open_fallback = false;
+    apply_sta_config(false);
+  }
+
+  esp_err_t err = esp_wifi_connect();
+  if (err != ESP_OK)
+  {
+    ESP_LOGW(TAG_STA, "Connect failed to start: %s", esp_err_to_name(err));
+    schedule_reconnect();
+  }
+}
+
 static void reconnect_timer_cb(void *arg)
 {
-  esp_err_t err = esp_wifi_connect();
+  esp_err_t err = start_uplink_connect();
   if (err != ESP_OK)
   {
     ESP_LOGW(TAG_STA, "Connect failed to start: %s", esp_err_to_name(err));
@@ -1732,14 +1861,14 @@ static esp_err_t save_handler(httpd_req_t *req)
     return ESP_FAIL;
   }
 
-  char *body = (char *)malloc(1536);
+  char *body = (char *)malloc(FORM_BODY_MAX);
   if (!body)
   {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
     return ESP_FAIL;
   }
 
-  if (!read_post_body(req, body, 1536))
+  if (!read_post_body(req, body, FORM_BODY_MAX))
   {
     free(body);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing or too large form data");
@@ -1765,6 +1894,22 @@ static esp_err_t save_handler(httpd_req_t *req)
       memset(new_config.sta_password, 0, sizeof(new_config.sta_password));
     else
       strncpy(new_config.sta_password, temp_pass, sizeof(new_config.sta_password));
+  }
+
+  // More networks: empty name removes one; password blank keeps it, "-" removes it
+  for (int i = 0; !error && i < 4; i++)
+  {
+    char field[8];
+    snprintf(field, sizeof(field), "ssid%d", i + 2);
+    if (!parse_query_param(body, field, new_config.extra_ssid[i], sizeof(new_config.extra_ssid[i])))
+      continue; // not in the form - keep
+    snprintf(field, sizeof(field), "pass%d", i + 2);
+    memset(temp_pass, 0, sizeof(temp_pass));
+    if (new_config.extra_ssid[i][0] == '\0' ||
+        (parse_query_param(body, field, temp_pass, sizeof(temp_pass)) && strcmp(temp_pass, "-") == 0))
+      memset(new_config.extra_password[i], 0, sizeof(new_config.extra_password[i]));
+    else if (strlen(temp_pass) > 0)
+      strlcpy(new_config.extra_password[i], temp_pass, sizeof(new_config.extra_password[i]));
   }
 
   if (!error && !parse_query_param(body, "ap_ssid", new_config.ap_ssid, sizeof(new_config.ap_ssid)))
@@ -2180,10 +2325,13 @@ static esp_err_t debug_handler(httpd_req_t *req)
                (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
 
   /* Uplink connection */
-  debug_printf(req, "== Uplink WiFi ==\nSSID: \"%s\"\nSaved password: %s\n", stored_config.sta_ssid,
-               strlen(stored_config.sta_password) > 0 ? "yes" : "no (open network)");
+  httpd_resp_sendstr_chunk(req, "== Uplink WiFi ==\nSaved networks (* = current):\n");
+  for (int i = 0; i < UPLINK_NETWORKS; i++)
+    if (network_ssid(i)[0] != '\0')
+      debug_printf(req, " %c \"%s\", password: %s\n", i == active_network ? '*' : ' ', network_ssid(i),
+                   strlen(network_password(i)) > 0 ? "yes" : "no (open network)");
   debug_printf(req, "Connect mode: %s\n",
-               strlen(stored_config.sta_password) == 0 ? "open, any security"
+               strlen(network_password(active_network)) == 0 ? "open, any security"
                : sta_open_fallback                    ? "without password (open network fallback)"
                                                       : "with password, WPA2 or better");
   debug_printf(req, "Connected: %s\n", sta_connected ? "yes" : "no");
@@ -2245,15 +2393,16 @@ static esp_err_t debug_handler(httpd_req_t *req)
       bool found = false;
       for (int i = 0; i < count; i++)
       {
-        bool match = strcmp((const char *)records[i].ssid, stored_config.sta_ssid) == 0;
+        bool match = false;
+        for (int n = 0; n < UPLINK_NETWORKS && !match; n++)
+          match = network_ssid(n)[0] != '\0' && strcmp((const char *)records[i].ssid, network_ssid(n)) == 0;
         found |= match;
         debug_printf(req, "%s %-32s ch %2d %4d dBm  %s\n", match ? ">>" : "  ",
                      records[i].ssid[0] ? (const char *)records[i].ssid : "(hidden)", records[i].primary,
                      records[i].rssi, authmode_name(records[i].authmode));
       }
       if (!found)
-        debug_printf(req, "Uplink \"%s\" not found - check the name, the distance, or whether it is 5 GHz only\n",
-                     stored_config.sta_ssid);
+        httpd_resp_sendstr_chunk(req, "No saved network found - check the names, the distance, or whether they are 5 GHz only\n");
       free(records);
     }
   }
@@ -2812,7 +2961,7 @@ static void draw_status_screen(void)
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
     {
       // WiFi name in bright green
-      lcd_draw_string(6, uplink_y + 14, stored_config.sta_ssid, TERM_ACCENT, TERM_BG);
+      lcd_draw_string(6, uplink_y + 14, network_ssid(active_network), TERM_ACCENT, TERM_BG);
 
       // Signal strength bars
       draw_signal_bars(6, uplink_y + 27, ap_info.rssi);
@@ -2863,7 +3012,7 @@ static void draw_status_screen(void)
   else
   {
     // Disconnected state - network name and why the last attempt failed
-    lcd_draw_string(6, uplink_y + 14, stored_config.sta_ssid, TERM_GREEN_DIM, TERM_BG);
+    lcd_draw_string(6, uplink_y + 14, network_ssid(active_network), TERM_GREEN_DIM, TERM_BG);
     char reason[32];
     if (last_disconnect_reason == 0)
       snprintf(reason, sizeof(reason), "Searching...");
@@ -3991,7 +4140,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (!config_mode)
     {
       ESP_LOGI(TAG_STA, "Station started, connecting to AP...");
-      esp_wifi_connect();
+      start_uplink_connect();
+    }
+  }
+  else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE)
+  {
+    // Only the scan that picks the uplink network - the web panel scans on its own
+    if (uplink_scan_pending)
+    {
+      uplink_scan_pending = false;
+      uplink_scan_done();
     }
   }
   else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
@@ -4009,7 +4167,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     // network as an open one, and back (the network may change security)
     if ((event->reason == WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD ||
          event->reason == WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY) &&
-        strlen(stored_config.sta_password) > 0 && !scan_in_progress)
+        strlen(network_password(active_network)) > 0 && !scan_in_progress)
     {
       sta_open_fallback = !sta_open_fallback;
       ESP_LOGW(TAG_STA, "%s", sta_open_fallback ? "Uplink may be an open network - connecting without password"
@@ -4173,7 +4331,7 @@ static void status_task(void *pvParameters)
       {
         ESP_LOGI(TAG_MAIN, "━━━ STATUS ━━━");
         ESP_LOGI(TAG_MAIN, "Uplink: %s | RSSI: %d dBm",
-                 stored_config.sta_ssid, ap_info.rssi);
+                 network_ssid(active_network), ap_info.rssi);
         ESP_LOGI(TAG_MAIN, "AP Clients: %d", ap_client_count);
         ESP_LOGI(TAG_MAIN, "NAT: %s", napt_enabled ? "✓ ACTIVE" : "✗ DISABLED");
         ESP_LOGI(TAG_MAIN, "Internet: %s",
