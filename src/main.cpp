@@ -107,6 +107,7 @@
 #define NVS_KEY_PORTAL_REDIRECT "portal_redir"
 #define NVS_KEY_TX_POWER "tx_pwr"
 #define NVS_KEY_ECO_MODE "eco"
+#define NVS_KEY_WG_KILL_SWITCH "wg_kill"
 
 /* WireGuard defaults */
 #define WG_DEFAULT_PORT 51820
@@ -136,6 +137,7 @@ typedef struct
   uint16_t wg_port;
   uint16_t wg_keepalive;
   char wg_dns[16]; // DNS offered to AP clients when VPN is enabled (empty = upstream)
+  bool wg_kill_switch; // block client traffic while the tunnel is down
 
   /* Device */
   char admin_password[64];  // web panel login (empty only in configs from older firmware)
@@ -325,6 +327,10 @@ static uplink_state_t uplink_state = UPLINK_OFFLINE;
 static char portal_url[256] = {0};
 static char probe_info[192] = {0}; // result of the last connectivity check (web panel diagnostics)
 
+/* Kill switch: client traffic only through the tunnel, except during portal login */
+static volatile uint32_t kill_switch_drops = 0;
+static bool kill_switch_active(void);
+
 /* Clients' connectivity checks go to this device while the uplink needs a login */
 static bool intercept_portal_probes(void)
 {
@@ -362,6 +368,12 @@ typedef struct
 
 static esp_err_t wg_snapshot_cb(void *arg); // runs in the TCP/IP task
 static volatile bool wg_is_default = false; // also read in the TCP/IP task (MSS clamping)
+
+static bool kill_switch_active(void)
+{
+  return stored_config.wg_enabled && stored_config.wg_kill_switch && !wg_is_default &&
+         uplink_state != UPLINK_PORTAL && uplink_state != UPLINK_NO_INTERNET;
+}
 
 /* Status task handle (notified on uplink changes) */
 static TaskHandle_t status_task_handle = NULL;
@@ -700,6 +712,8 @@ static void send_status_html(httpd_req_t *req)
       httpd_resp_sendstr_chunk(req, "<br>WireGuard: handshake OK, waiting for uplink");
     else
       httpd_resp_sendstr_chunk(req, "<br>WireGuard: connecting...");
+    if (kill_switch_active())
+      httpd_resp_sendstr_chunk(req, "<br><b>Kill switch: client traffic is blocked until the VPN is up</b>");
   }
   if (sta_open_fallback && sta_connected)
     httpd_resp_sendstr_chunk(req, "<br>Connected without password - the uplink is an open network");
@@ -823,9 +837,15 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
   send_html_escaped(req, config->wg_dns);
   httpd_resp_sendstr_chunk(req,
                            "' placeholder='e.g. 1.1.1.1 (empty = uplink DNS)'>"
+                           "<label><input type='checkbox' name='wg_kill' value='1'");
+  if (config->wg_kill_switch)
+    httpd_resp_sendstr_chunk(req, " checked");
+  httpd_resp_sendstr_chunk(req,
+                           ">Block client traffic while the VPN is down (kill switch)</label>"
                            "<div class='info'>The tunnel uses AllowedIPs 0.0.0.0/0. Traffic switches to the VPN "
-                           "after a successful handshake and while the uplink has internet access "
-                           "(not during captive portal login).</div>"
+                           "after a successful handshake and while the uplink has internet access. "
+                           "During captive portal login clients always reach the network directly - "
+                           "with the kill switch, at all other times only through the VPN.</div>"
                            "</div>"
                            "<div class='section'>"
                            "<h2 style='color:#4CAF50;margin-top:0'>Device</h2>"
@@ -1288,6 +1308,7 @@ static esp_err_t save_wifi_config(const repeater_config_t *config)
   nvs_set_u16(nvs_handle, NVS_KEY_WG_PORT, config->wg_port);
   nvs_set_u16(nvs_handle, NVS_KEY_WG_KEEPALIVE, config->wg_keepalive);
   nvs_set_str(nvs_handle, NVS_KEY_WG_DNS, config->wg_dns);
+  nvs_set_u8(nvs_handle, NVS_KEY_WG_KILL_SWITCH, config->wg_kill_switch ? 1 : 0);
 
   nvs_set_str(nvs_handle, NVS_KEY_ADMIN_PASS, config->admin_password);
   nvs_set_u16(nvs_handle, NVS_KEY_DISPLAY_TIMEOUT, config->display_timeout);
@@ -1367,6 +1388,9 @@ static esp_err_t load_wifi_config(repeater_config_t *config)
 
   len = sizeof(config->wg_dns);
   nvs_get_str(nvs_handle, NVS_KEY_WG_DNS, config->wg_dns, &len);
+  uint8_t kill_switch = 0;
+  nvs_get_u8(nvs_handle, NVS_KEY_WG_KILL_SWITCH, &kill_switch);
+  config->wg_kill_switch = (kill_switch == 1);
 
   // Device settings (absent in configs saved by older firmware)
   len = sizeof(config->admin_password);
@@ -1775,6 +1799,7 @@ static esp_err_t save_handler(httpd_req_t *req)
   parse_query_param(body, "wg_addr", new_config.wg_address, sizeof(new_config.wg_address));
   parse_query_param(body, "wg_host", new_config.wg_endpoint, sizeof(new_config.wg_endpoint));
   parse_query_param(body, "wg_dns", new_config.wg_dns, sizeof(new_config.wg_dns));
+  new_config.wg_kill_switch = parse_query_param(body, "wg_kill", temp, sizeof(temp));
 
   // Keys are read in full so that a too long key is rejected instead of truncated
   memset(temp, 0, sizeof(temp));
@@ -2081,6 +2106,9 @@ static void send_wireguard_debug(httpd_req_t *req, int64_t now_us)
                stored_config.wg_endpoint, (unsigned)stored_config.wg_port, stored_config.wg_address,
                (unsigned)stored_config.wg_keepalive);
   debug_printf(req, "Stage: %s\n", wg_status);
+  debug_printf(req, "Kill switch: %s, %lu packets blocked\n",
+               !stored_config.wg_kill_switch ? "off" : kill_switch_active() ? "BLOCKING client traffic" : "on (not blocking)",
+               (unsigned long)kill_switch_drops);
 
   time_t t = time(NULL);
   struct tm utc;
@@ -2587,7 +2615,7 @@ static void dns_proxy_task(void *pvParameters)
         sendto(sock, buf, resp_len, 0, (struct sockaddr *)&client, client_len);
         ESP_LOGD(TAG_MAIN, "DNS proxy: %s -> portal redirect", name);
       }
-      else if (dns_upstream_server(&server))
+      else if (!kill_switch_active() && dns_upstream_server(&server)) // no DNS leak past the kill switch
       {
         // Reuse a free or timed out slot, else the oldest one
         TickType_t now = xTaskGetTickCount();
@@ -2824,7 +2852,7 @@ static void draw_status_screen(void)
     // WireGuard tunnel status
     if (stored_config.wg_enabled)
     {
-      const char *vpn_str = wg_is_default ? "VPN:ON" : (wg_peer_up ? "VPN:RDY" : "VPN:..");
+      const char *vpn_str = wg_is_default ? "VPN:ON" : kill_switch_active() ? "VPN:BLK" : (wg_peer_up ? "VPN:RDY" : "VPN:..");
       lcd_draw_string(176, uplink_y + 27, vpn_str, wg_is_default ? TERM_GREEN : TERM_GREEN_DIM, TERM_BG);
     }
     else if (wg_configured())
@@ -3633,6 +3661,52 @@ static err_t ap_output_clamped(struct netif *netif, struct pbuf *p, const ip4_ad
   return ap_output_orig(netif, p, addr);
 }
 
+/*
+ * Kill switch: frames from AP clients enter here (WiFi task). While it is
+ * active only ARP, broadcast/multicast (DHCP) and packets to this device
+ * (web panel, DNS proxy) get through - nothing is forwarded to the uplink.
+ */
+static netif_input_fn ap_input_orig = NULL;
+static volatile uint32_t ap_ip_addr = 0; // network byte order, updated when the AP address changes
+
+static err_t ap_input_filtered(struct pbuf *p, struct netif *netif)
+{
+  if (kill_switch_active() && p->len >= 34)
+  {
+    const uint8_t *frame = (const uint8_t *)p->payload;
+    uint16_t ethertype = (frame[12] << 8) | frame[13];
+    if (ethertype == 0x0800)
+    {
+      uint32_t dst;
+      memcpy(&dst, frame + 14 + 16, 4);
+      uint8_t first = frame[30]; // first byte of the destination address
+      bool local = dst == ap_ip_addr || dst == 0xFFFFFFFF || (first >= 224 && first <= 239) ||
+                   (frame[0] & 0x01); // broadcast/multicast frame (DHCP, mDNS)
+      if (!local)
+      {
+        kill_switch_drops = kill_switch_drops + 1;
+        pbuf_free(p);
+        return ERR_OK;
+      }
+    }
+  }
+  return ap_input_orig(p, netif);
+}
+
+static esp_err_t ap_install_input_filter_cb(void *ctx)
+{
+  struct netif *ap_lwip_netif = (struct netif *)esp_netif_get_netif_impl(ap_netif);
+  if (!ap_lwip_netif)
+    return ESP_FAIL;
+  ap_ip_addr = ip4_addr_get_u32(netif_ip4_addr(ap_lwip_netif));
+  if (ap_lwip_netif->input != ap_input_filtered)
+  {
+    ap_input_orig = ap_lwip_netif->input;
+    ap_lwip_netif->input = ap_input_filtered;
+  }
+  return ESP_OK;
+}
+
 /* Wrap the output functions of the tunnel and AP interfaces (TCP/IP task) */
 static esp_err_t wg_install_mss_clamping_cb(void *ctx)
 {
@@ -3874,6 +3948,7 @@ static void ensure_ap_subnet_free(const esp_netif_ip_info_t *uplink)
     esp_netif_set_ip_info(ap_netif, &candidate);
     esp_netif_dhcps_start(ap_netif);
     strlcpy(ap_ip_str, AP_SUBNET_CANDIDATES[i], sizeof(ap_ip_str));
+    ap_ip_addr = candidate.ip.addr; // kill switch filter
     esp_wifi_deauth_sta(0); // clients reconnect and get an address in the new subnet
     return;
   }
@@ -4291,6 +4366,9 @@ extern "C" void app_main(void)
     /* Battery: transmit power limit */
     if (stored_config.tx_power > 0)
       apply_tx_power(stored_config.tx_power);
+
+    /* Kill switch filter on the AP interface (inactive unless enabled) */
+    esp_netif_tcpip_exec(ap_install_input_filter_cb, NULL);
 
     /* DNS proxy - lets clients open the uplink's captive portal login page */
     if (stored_config.portal_redirect)
