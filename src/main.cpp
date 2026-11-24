@@ -1122,12 +1122,29 @@ static void lcd_fill_screen(uint16_t color)
 /**
  * Draw a character at position (x, y)
  */
+/* Arrows for the key hints, at their CP437 codes: 0x18 up, 0x19 down, 0x1A right, 0x1B left */
+#define CHAR_UP "\x18"
+#define CHAR_DOWN "\x19"
+#define CHAR_RIGHT "\x1A"
+#define CHAR_LEFT "\x1B"
+static const uint8_t arrow_glyphs[4][8] = {
+    {0x18, 0x3C, 0x7E, 0x18, 0x18, 0x18, 0x18, 0x00}, // up
+    {0x18, 0x18, 0x18, 0x18, 0x7E, 0x3C, 0x18, 0x00}, // down
+    {0x10, 0x30, 0x70, 0x7F, 0x7F, 0x70, 0x30, 0x10}, // right
+    {0x04, 0x06, 0x07, 0x7F, 0x7F, 0x07, 0x06, 0x04}, // left
+};
+
 static void lcd_draw_char(int x, int y, char c, uint16_t color, uint16_t bg_color)
 {
-  if (!framebuffer || c < 32 || c > 127)
+  const uint8_t *glyph;
+  if (c >= 0x18 && c <= 0x1B)
+    glyph = arrow_glyphs[c - 0x18];
+  else if (c >= 32 && c <= 127)
+    glyph = font8x8[c - 32];
+  else
     return;
-
-  const uint8_t *glyph = font8x8[c - 32];
+  if (!framebuffer)
+    return;
 
   for (int py = 0; py < 8; py++)
   {
@@ -3365,7 +3382,7 @@ static void draw_menu_screen(void)
   {
     lcd_draw_string(84, 4, "WIFI MENU", THEME_TITLE, THEME_BAR);
     lcd_draw_string(8, 56, "Scanning for networks...", THEME_TEXT, THEME_BG);
-    lcd_draw_string(8, 122, "fn+`: cancel", THEME_DIM, THEME_BG);
+    lcd_draw_string(8, 122, CHAR_LEFT " cancel", THEME_DIM, THEME_BG);
     return;
   }
 
@@ -3396,7 +3413,8 @@ static void draw_menu_screen(void)
       if (strcmp(n->ssid, network_ssid(active_network)) == 0 && sta_connected)
         lcd_draw_string(224, y, "<", THEME_OK, bg);
     }
-    lcd_draw_string(4, 122, "Ent:join ;.:move R:scan fn+`", THEME_DIM, THEME_BG);
+    lcd_draw_string(4, 122, CHAR_UP CHAR_DOWN " move " CHAR_RIGHT " join " CHAR_LEFT " back R scan", THEME_DIM,
+                    THEME_BG);
     return;
   }
 
@@ -3421,8 +3439,8 @@ static void draw_menu_screen(void)
     else
       snprintf(info, sizeof(info), "%d characters", len);
     lcd_draw_string(8, 72, info, len < MENU_PASSWORD_MIN ? THEME_TEXT : THEME_DIM, THEME_BG);
-    lcd_draw_string(8, 108, "Shift: capitals/symbols", THEME_DIM, THEME_BG);
-    lcd_draw_string(8, 122, "Ent:connect Del:erase fn+`", THEME_DIM, THEME_BG);
+    lcd_draw_string(8, 108, "Shift: Aa !@#  Del: erase", THEME_DIM, THEME_BG);
+    lcd_draw_string(8, 122, "Enter connect  fn+" CHAR_LEFT " back", THEME_DIM, THEME_BG);
   }
 }
 

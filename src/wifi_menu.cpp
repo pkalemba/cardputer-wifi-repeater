@@ -127,8 +127,9 @@ static menu_action_t list_key(wifi_menu_t *menu, uint8_t key)
 {
   switch (key)
   {
+  // The arrow keys (; . , /) work without fn here - there is no text to type
   case KC_UP:
-  case ';': // the arrow keys work without fn here - there is no text to type
+  case ';':
     if (menu->count == 0)
       return MENU_ACT_NONE;
     move_selection(menu, -1);
@@ -144,6 +145,8 @@ static menu_action_t list_key(wifi_menu_t *menu, uint8_t key)
     start_scan(menu);
     return MENU_ACT_SCAN;
   case KC_ENTER:
+  case KC_RIGHT:
+  case '/':
   {
     const menu_network_t *network = wifi_menu_selected(menu);
     if (!network)
@@ -175,6 +178,8 @@ static menu_action_t list_key(wifi_menu_t *menu, uint8_t key)
   }
   case KC_ESC:
   case KC_BACKSPACE:
+  case KC_LEFT:
+  case ',':
   case '`':
     menu->screen = MENU_CLOSED;
     return MENU_ACT_CLOSE;
@@ -193,7 +198,7 @@ static menu_action_t password_key(wifi_menu_t *menu, uint8_t key)
     menu->screen = MENU_CLOSED;
     return MENU_ACT_CONNECT;
   }
-  if (key == KC_ESC)
+  if (key == KC_ESC || key == KC_LEFT) // fn+` or fn+left (plain , is text here)
   {
     menu->screen = MENU_LIST;
     return MENU_ACT_REDRAW;
@@ -225,7 +230,7 @@ menu_action_t wifi_menu_key(wifi_menu_t *menu, uint8_t key)
   case MENU_PASSWORD:
     return password_key(menu, key);
   case MENU_SCANNING:
-    if (key == KC_ESC || key == '`')
+    if (key == KC_ESC || key == KC_LEFT || key == ',' || key == '`')
     {
       menu->screen = MENU_CLOSED;
       return MENU_ACT_CLOSE;

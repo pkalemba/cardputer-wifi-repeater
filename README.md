@@ -132,9 +132,10 @@ After configuration:
 
 - **W**: WiFi menu - pick the uplink network on the device, no phone needed:
   - the list shows the networks in range: `*` = password needed, `+` = already saved, `<` = current
-  - `;` / `.` move (the arrow keys), **Enter** joins, **R** scans again, **fn + `** goes back
+  - arrow keys: **↑ ↓** move, **→** (or Enter) joins, **←** goes back; **R** scans again
   - a secured network that is not saved asks for its password (Shift for capitals and
-    symbols, Del erases); **P** on a saved network types a new password
+    symbols, Del erases, **fn + ←** back - the arrow keys type , ; . / there); **P** on a
+    saved network types a new password
   - the chosen network is saved as the main network (the previous one stays in the
     saved networks) and the repeater connects to it right away
 - **V**: switches the WireGuard VPN on or off (remembered across restarts, same as the

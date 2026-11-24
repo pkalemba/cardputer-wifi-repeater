@@ -502,6 +502,8 @@ TEST(test_menu_list)
   CHECK_EQ(menu.selected, MENU_VISIBLE_ROWS);
   CHECK_EQ(menu.scroll, 1); // selection stays visible
   CHECK_EQ(wifi_menu_key(&menu, 'x'), MENU_ACT_NONE);
+  CHECK_EQ(wifi_menu_key(&menu, ';'), MENU_ACT_REDRAW); // plain ; works as up
+  CHECK_EQ(menu.selected, MENU_VISIBLE_ROWS - 1);
   CHECK_EQ(wifi_menu_key(&menu, 'r'), MENU_ACT_SCAN); // rescan
   CHECK_EQ(menu.screen, MENU_SCANNING);
   CHECK_EQ(menu.count, 0);
@@ -512,6 +514,13 @@ TEST(test_menu_list)
   CHECK(wifi_menu_selected(&empty) == NULL);
   CHECK_EQ(wifi_menu_key(&empty, KC_ESC), MENU_ACT_CLOSE);
   CHECK_EQ(empty.screen, MENU_CLOSED);
+
+  // Left arrow (plain , in the list) goes back, also while scanning
+  wifi_menu_t list = menu_with(3);
+  CHECK_EQ(wifi_menu_key(&list, ','), MENU_ACT_CLOSE);
+  wifi_menu_open(&list);
+  CHECK_EQ(wifi_menu_key(&list, 'a'), MENU_ACT_NONE);
+  CHECK_EQ(wifi_menu_key(&list, KC_LEFT), MENU_ACT_CLOSE);
 }
 
 TEST(test_menu_connect)
@@ -538,12 +547,17 @@ TEST(test_menu_connect)
   CHECK_EQ(wifi_menu_key(&menu, 'p'), MENU_ACT_REDRAW);
   CHECK_EQ(menu.screen, MENU_PASSWORD);
 
+  // Right arrow (plain /) joins like Enter
+  menu = menu_with(4);
+  CHECK_EQ(wifi_menu_key(&menu, '/'), MENU_ACT_CONNECT);
+  CHECK_STR(wifi_menu_selected(&menu)->ssid, "net0");
+
   // Secured network: password screen
   menu = menu_with(4);
   wifi_menu_key(&menu, KC_DOWN);
   CHECK_EQ(wifi_menu_key(&menu, KC_ENTER), MENU_ACT_REDRAW);
   CHECK_EQ(menu.screen, MENU_PASSWORD);
-  const char *typed = "Pa ss;.1";
+  const char *typed = "Pa ss;.1"; // , / ; . are text in the password
   for (const char *c = typed; *c; c++)
     CHECK_EQ(wifi_menu_key(&menu, (uint8_t)*c), MENU_ACT_REDRAW); // ; and . are text here
   CHECK_STR(menu.password, "Pa ss;.1");
@@ -558,9 +572,14 @@ TEST(test_menu_connect)
   CHECK(menu.password_entered);
   CHECK_EQ(menu.screen, MENU_CLOSED);
 
-  // Esc goes back to the list, Esc again closes
+  // Esc or fn+left goes back to the list, Esc again closes
   menu = menu_with(4);
   wifi_menu_key(&menu, KC_DOWN);
+  wifi_menu_key(&menu, KC_ENTER);
+  CHECK_EQ(wifi_menu_key(&menu, ','), MENU_ACT_REDRAW); // typed
+  CHECK_STR(menu.password, ",");
+  CHECK_EQ(wifi_menu_key(&menu, KC_LEFT), MENU_ACT_REDRAW);
+  CHECK_EQ(menu.screen, MENU_LIST);
   wifi_menu_key(&menu, KC_ENTER);
   CHECK_EQ(wifi_menu_key(&menu, KC_ESC), MENU_ACT_REDRAW);
   CHECK_EQ(menu.screen, MENU_LIST);
