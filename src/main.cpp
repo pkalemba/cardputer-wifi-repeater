@@ -3015,21 +3015,95 @@ static void draw_battery(int right_x, int y, uint16_t bg_color)
 /**
  * Setup mode screen: how to reach the configuration page
  */
+/* One pixel frame in the border color */
+static void draw_frame(int x, int y, int w, int h)
+{
+  lcd_fill_rect(x, y, w, 1, THEME_BORDER);
+  lcd_fill_rect(x, y + h - 1, w, 1, THEME_BORDER);
+  lcd_fill_rect(x, y, 1, h, THEME_BORDER);
+  lcd_fill_rect(x + w - 1, y, 1, h, THEME_BORDER);
+}
+
+#define QR_MAX_VERSION 10 // 57 modules: the longest SSID + password with every character escaped
+
+static uint8_t wifi_qr[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
+
+/* Encode the QR code to join a WiFi network; modules per side, 0 if too long */
+static int wifi_qr_encode(const char *ssid, const char *password)
+{
+  static uint8_t temp[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
+  char payload[256];
+  if (!wifi_qr_payload(payload, sizeof(payload), ssid, password) ||
+      !qrcodegen_encodeText(payload, temp, wifi_qr, qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN, QR_MAX_VERSION,
+                            qrcodegen_Mask_AUTO, true))
+    return 0;
+  return qrcodegen_getSize(wifi_qr);
+}
+
+/* Pixels per module so the code with its quiet zone (2 modules a side) fits max_side */
+static int wifi_qr_scale(int size, int max_side) { return size > 0 ? max_side / (size + 4) : 0; }
+
+/*
+ * Draw the encoded code at (left, top): dark modules on a light square
+ * with a quiet zone, which is what phone cameras expect. Returns the side.
+ */
+static int wifi_qr_draw(int left, int top, int scale)
+{
+  int size = qrcodegen_getSize(wifi_qr);
+  int side = (size + 4) * scale;
+  lcd_fill_rect(left, top, side, side, GRUV_FG);
+  for (int y = 0; y < size; y++)
+    for (int x = 0; x < size; x++)
+      if (qrcodegen_getModule(wifi_qr, x, y))
+        lcd_fill_rect(left + (x + 2) * scale, top + (y + 2) * scale, scale, scale, GRUV_BG0);
+  return side;
+}
+
+/*
+ * Setup mode: QR code to join the setup network on the left, the three
+ * steps in frames on the right
+ */
 static void draw_setup_screen(void)
 {
   lcd_fill_screen(THEME_BG);
-  lcd_fill_rect(0, 0, 240, 18, THEME_BAR);
-  lcd_draw_string(40, 5, "SETUP MODE", THEME_TITLE, THEME_BAR);
-  draw_battery(236, 4, THEME_BAR);
+  lcd_fill_rect(0, 0, 240, 16, THEME_BAR);
+  lcd_draw_string(6, 4, "SETUP MODE", THEME_TITLE, THEME_BAR);
+  draw_battery(236, 3, THEME_BAR);
 
-  lcd_draw_string(5, 30, "WiFi:", THEME_DIM, THEME_BG);
-  lcd_draw_string(5, 45, DEFAULT_CONFIG_AP_SSID, THEME_TEXT, THEME_BG);
+  // QR code in a frame, vertically centered below the header
+  const int area_top = 18, area_height = 135 - area_top;
+  int scale = wifi_qr_scale(wifi_qr_encode(stored_config.ap_ssid, stored_config.ap_password), area_height - 8);
+  int side = 0;
+  if (scale > 0)
+  {
+    int size = qrcodegen_getSize(wifi_qr);
+    int top = area_top + (area_height - (size + 4) * scale) / 2;
+    side = wifi_qr_draw(6, top, scale);
+    draw_frame(3, top - 3, side + 6, side + 6);
+  }
 
-  lcd_draw_string(5, 65, "Config IP:", THEME_DIM, THEME_BG);
-  lcd_draw_string(5, 80, ap_ip_str, THEME_TITLE, THEME_BG);
-
-  lcd_draw_string(5, 100, "Open browser and", THEME_DIM, THEME_BG);
-  lcd_draw_string(5, 113, "visit IP above", THEME_DIM, THEME_BG);
+  // Steps
+  int x = side > 0 ? side + 14 : 6;
+  int w = 238 - x;
+  int columns = (w - 8) / 8;
+  struct
+  {
+    const char *title;
+    const char *value;
+  } steps[3] = {
+      {"1 JOIN WIFI", stored_config.ap_ssid},
+      {"2 OPEN", ap_ip_str},
+      {"3 SET UP", "and Save"},
+  };
+  for (int i = 0; i < 3; i++)
+  {
+    int y = area_top + 2 + i * 39;
+    draw_frame(x, y, w, 36);
+    lcd_draw_string(x + 4, y + 5, steps[i].title, THEME_TITLE, THEME_BG);
+    char value[32];
+    snprintf(value, sizeof(value), "%.*s", columns < 31 ? columns : 31, steps[i].value);
+    lcd_draw_string(x + 4, y + 20, value, i == 1 ? GRUV_AQUA : THEME_TEXT, THEME_BG);
+  }
 }
 
 /**
@@ -3492,36 +3566,18 @@ static void draw_help_screen(void)
  * QR CODE TO JOIN THE REPEATER'S WIFI (Q key)
  * ═══════════════════════════════════════════════════════════════════ */
 
-#define QR_MAX_VERSION 10 // 57 modules: the longest SSID + password with every character escaped
-
 static void draw_qr_screen(void)
 {
-  static uint8_t qr[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
-  static uint8_t temp[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
-  char payload[256];
-
   lcd_fill_screen(THEME_BG);
-  if (!wifi_qr_payload(payload, sizeof(payload), stored_config.ap_ssid, stored_config.ap_password) ||
-      !qrcodegen_encodeText(payload, temp, qr, qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN, QR_MAX_VERSION,
-                            qrcodegen_Mask_AUTO, true))
+  const int height = 135, left = 2;
+  int size = wifi_qr_encode(stored_config.ap_ssid, stored_config.ap_password);
+  int scale = wifi_qr_scale(size, height - 4);
+  if (scale == 0)
   {
     lcd_draw_string(8, 60, "QR code too long", THEME_ERROR, THEME_BG);
     return;
   }
-
-  // Dark modules on a light square with a quiet zone - what phone cameras expect
-  const int height = 135;
-  int size = qrcodegen_getSize(qr);
-  int scale = (height - 4) / (size + 4);
-  if (scale < 1)
-    scale = 1;
-  int side = (size + 4) * scale;
-  int left = 2, top = (height - side) / 2;
-  lcd_fill_rect(left, top, side, side, GRUV_FG);
-  for (int y = 0; y < size; y++)
-    for (int x = 0; x < size; x++)
-      if (qrcodegen_getModule(qr, x, y))
-        lcd_fill_rect(left + (x + 2) * scale, top + (y + 2) * scale, scale, scale, GRUV_BG0);
+  int side = wifi_qr_draw(left, (height - (size + 4) * scale) / 2, scale);
 
   // Network name and password next to it, wrapped
   int text_x = left + side + 8;
