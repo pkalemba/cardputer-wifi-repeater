@@ -108,6 +108,8 @@
 #define NVS_KEY_TX_POWER "tx_pwr"
 #define NVS_KEY_ECO_MODE "eco"
 #define NVS_KEY_WG_KILL_SWITCH "wg_kill"
+#define NVS_KEY_MAC_MODE "mac_mode"
+#define NVS_KEY_STA_MAC "sta_mac"
 
 /* WireGuard defaults */
 #define WG_DEFAULT_PORT 51820
@@ -125,6 +127,8 @@ typedef struct
   char sta_password[64];
   char extra_ssid[4][32]; // more uplink networks, the strongest one in range is used
   char extra_password[4][64];
+  uint8_t sta_mac_mode; // uplink MAC address: MAC_FACTORY, MAC_CUSTOM, MAC_RANDOM
+  uint8_t sta_mac[6];   // for MAC_CUSTOM
   char ap_ssid[32];
   char ap_password[64];
   bool configured;
@@ -150,6 +154,11 @@ typedef struct
 } repeater_config_t;
 
 static repeater_config_t stored_config = {0};
+
+/* Uplink MAC address modes */
+#define MAC_FACTORY 0
+#define MAC_CUSTOM 1
+#define MAC_RANDOM 2 // new address at every start
 
 /* Saved uplink networks: 0 = main network, 1-4 = extra networks */
 #define UPLINK_NETWORKS 5
@@ -822,6 +831,31 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
   httpd_resp_sendstr_chunk(req,
                            "<div class='info'>Click a field, then a network from the scan to fill it in. "
                            "Empty name removes a network.</div>"
+                           "<label>Uplink MAC address:</label><select name='mac_mode'>");
+  {
+    static const char *const MAC_MODES[] = {"Factory address", "Custom (below)", "Random at every start"};
+    for (int i = 0; i < 3; i++)
+    {
+      char option[80];
+      snprintf(option, sizeof(option), "<option value='%d'%s>%s</option>", i,
+               config->sta_mac_mode == i ? " selected" : "", MAC_MODES[i]);
+      httpd_resp_sendstr_chunk(req, option);
+    }
+    char mac_field[96];
+    if (config->sta_mac_mode == MAC_CUSTOM)
+      snprintf(mac_field, sizeof(mac_field), "</select><input type='text' name='sta_mac' value='" MACSTR "'",
+               MAC2STR(config->sta_mac));
+    else
+      snprintf(mac_field, sizeof(mac_field), "</select><input type='text' name='sta_mac' value=''");
+    httpd_resp_sendstr_chunk(req, mac_field);
+  }
+  httpd_resp_sendstr_chunk(req,
+                           " placeholder='AA:BB:CC:DD:EE:FF'>"
+                           "<div class='info'>Custom: the hotel network sees the repeater as another device - "
+                           "e.g. your phone that already passed the login page. Use the address the phone shows "
+                           "in the details of the hotel network (phones use a different one per network) and "
+                           "disconnect the phone from the hotel network first. Random: a new address at every "
+                           "start, for networks that limit free time per device.</div>"
                            "</div>"
                            "<div class='section'>"
                            "<h2 style='color:#4CAF50;margin-top:0'>Access Point</h2>"
@@ -1284,6 +1318,30 @@ static void url_decode(char *dst, const char *src)
 /**
  * Parse URL query parameters and extract form fields
  */
+/**
+ * Parse "AA:BB:CC:DD:EE:FF" (also with '-' or without separators). Only
+ * unicast addresses (lowest bit of the first byte clear) are accepted.
+ */
+static bool parse_mac(const char *text, uint8_t mac[6])
+{
+  int digits = 0;
+  uint8_t value[6] = {0};
+  for (const char *c = text; *c; c++)
+  {
+    if (*c == ':' || *c == '-' || *c == ' ')
+      continue;
+    if (!isxdigit((unsigned char)*c) || digits >= 12)
+      return false;
+    int nibble = isdigit((unsigned char)*c) ? *c - '0' : (tolower((unsigned char)*c) - 'a' + 10);
+    value[digits / 2] = (value[digits / 2] << 4) | nibble;
+    digits++;
+  }
+  if (digits != 12 || (value[0] & 0x01))
+    return false;
+  memcpy(mac, value, 6);
+  return true;
+}
+
 static bool parse_query_param(const char *query, const char *field_name, char *output, size_t output_len)
 {
   if (!query)
@@ -1361,6 +1419,8 @@ static esp_err_t save_wifi_config(const repeater_config_t *config)
   nvs_set_u16(nvs_handle, NVS_KEY_WG_KEEPALIVE, config->wg_keepalive);
   nvs_set_str(nvs_handle, NVS_KEY_WG_DNS, config->wg_dns);
   nvs_set_u8(nvs_handle, NVS_KEY_WG_KILL_SWITCH, config->wg_kill_switch ? 1 : 0);
+  nvs_set_u8(nvs_handle, NVS_KEY_MAC_MODE, config->sta_mac_mode);
+  nvs_set_blob(nvs_handle, NVS_KEY_STA_MAC, config->sta_mac, sizeof(config->sta_mac));
 
   nvs_set_str(nvs_handle, NVS_KEY_ADMIN_PASS, config->admin_password);
   nvs_set_u16(nvs_handle, NVS_KEY_DISPLAY_TIMEOUT, config->display_timeout);
@@ -1455,6 +1515,11 @@ static esp_err_t load_wifi_config(repeater_config_t *config)
   uint8_t kill_switch = 0;
   nvs_get_u8(nvs_handle, NVS_KEY_WG_KILL_SWITCH, &kill_switch);
   config->wg_kill_switch = (kill_switch == 1);
+
+  // Uplink MAC address (absent in configs saved by older firmware: factory address)
+  nvs_get_u8(nvs_handle, NVS_KEY_MAC_MODE, &config->sta_mac_mode);
+  len = sizeof(config->sta_mac);
+  nvs_get_blob(nvs_handle, NVS_KEY_STA_MAC, config->sta_mac, &len);
 
   // Device settings (absent in configs saved by older firmware)
   len = sizeof(config->admin_password);
@@ -1912,6 +1977,18 @@ static esp_err_t save_handler(httpd_req_t *req)
       strlcpy(new_config.extra_password[i], temp_pass, sizeof(new_config.extra_password[i]));
   }
 
+  // Uplink MAC address
+  memset(temp_pass, 0, sizeof(temp_pass));
+  if (!error && parse_query_param(body, "mac_mode", temp_pass, sizeof(temp_pass)))
+  {
+    int mode = atoi(temp_pass);
+    new_config.sta_mac_mode = (mode >= MAC_FACTORY && mode <= MAC_RANDOM) ? (uint8_t)mode : MAC_FACTORY;
+    memset(temp_pass, 0, sizeof(temp_pass));
+    parse_query_param(body, "sta_mac", temp_pass, sizeof(temp_pass));
+    if (new_config.sta_mac_mode == MAC_CUSTOM && !parse_mac(temp_pass, new_config.sta_mac))
+      error = "Uplink MAC address must look like AA:BB:CC:DD:EE:FF (unicast: 2nd digit even)";
+  }
+
   if (!error && !parse_query_param(body, "ap_ssid", new_config.ap_ssid, sizeof(new_config.ap_ssid)))
   {
     error = "Missing ap_ssid";
@@ -2334,6 +2411,12 @@ static esp_err_t debug_handler(httpd_req_t *req)
                strlen(network_password(active_network)) == 0 ? "open, any security"
                : sta_open_fallback                    ? "without password (open network fallback)"
                                                       : "with password, WPA2 or better");
+  uint8_t sta_mac[6] = {0};
+  esp_wifi_get_mac(WIFI_IF_STA, sta_mac);
+  debug_printf(req, "MAC address: " MACSTR " (%s)\n", MAC2STR(sta_mac),
+               stored_config.sta_mac_mode == MAC_CUSTOM   ? "custom"
+               : stored_config.sta_mac_mode == MAC_RANDOM ? "random at every start"
+                                                          : "factory");
   debug_printf(req, "Connected: %s\n", sta_connected ? "yes" : "no");
   if (sta_connected)
     debug_printf(req, "Connected for: %llds\n", (long long)((now - connected_since_us) / 1000000));
@@ -4503,6 +4586,28 @@ extern "C" void app_main(void)
     /* Disable power saving for better performance */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_LOGI(TAG_MAIN, "✓ Power saving disabled for optimal performance");
+
+    /* Uplink MAC address (only while the interface is stopped) */
+    if (stored_config.sta_mac_mode != MAC_FACTORY)
+    {
+      uint8_t mac[6];
+      if (stored_config.sta_mac_mode == MAC_CUSTOM)
+      {
+        memcpy(mac, stored_config.sta_mac, sizeof(mac));
+      }
+      else
+      {
+        esp_fill_random(mac, sizeof(mac));
+        mac[0] = (mac[0] & 0xFE) | 0x02; // unicast, locally administered
+      }
+      esp_err_t err = esp_wifi_set_mac(WIFI_IF_STA, mac);
+      if (err == ESP_OK)
+        ESP_LOGI(TAG_MAIN, "Uplink MAC address: " MACSTR " (%s)", MAC2STR(mac),
+                 stored_config.sta_mac_mode == MAC_CUSTOM ? "custom" : "random");
+      else
+        ESP_LOGE(TAG_MAIN, "Uplink MAC " MACSTR " rejected: %s - using the factory address", MAC2STR(mac),
+                 esp_err_to_name(err));
+    }
 
     /* Initialize AP and STA */
     wifi_init_softap();

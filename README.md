@@ -25,10 +25,13 @@
 ### 🔐 WireGuard VPN
 - **Full tunnel**: all client traffic (`0.0.0.0/0`) is routed through a WireGuard peer
 - **Automatic time sync** (SNTP) before the handshake - required by WireGuard
+- **Kill switch** (optional): while the tunnel is down, client traffic is blocked instead of going out through the hotel network (DNS included). During captive portal login traffic is let through so the login page can be reached. The display shows `VPN:BLK`
 - **Portal aware**: the tunnel takes over routing only once the uplink has real internet access, so hotel/airport login pages stay reachable
 - **Optional VPN DNS** offered to clients via DHCP
 
 ### 🏨 Captive Portal Support
+- **Several saved networks**: up to five uplinks (home, hotel, phone hotspot...). The repeater connects to the strongest one in range and switches when it is gone
+- **Uplink MAC address**: factory, custom (e.g. the address of a phone that already passed a hotel login page) or random at every start (for networks that limit free time per device)
 - **Open networks**: hotel/airport WiFi without a password works. Leave the uplink password empty, or pick an open network from the scan. With a password saved, the repeater still joins the network if it turns out to be open; enter `-` as the password to remove the saved one
 - **Uplink portal detection**: recognizes hotel/airport login pages and shows `LOGIN` on the display; the web UI links to the login page. Signing in once from any client unlocks internet for all clients (they share the repeater's address)
   - several probes (Google, Apple, Microsoft) and a DNS check, so portals that block all traffic before login are recognized too
