@@ -182,8 +182,13 @@ uplink's login page on clients** in the Device section to give clients the uplin
 
 ### WireGuard VPN
 
-Fill in the **WireGuard VPN** section of the web interface with values from your
-WireGuard client config:
+The quickest way: **Import a configuration file (.conf)** in the WireGuard VPN section and
+pick the client file (wg-quick, MikroTik or WireGuard app export). The repeater reads it and
+fills in the fields - full tunnel for `AllowedIPs = 0.0.0.0/0`, split tunnel for a list of
+networks; IPv6 entries are skipped (IPv4 only), a missing `PersistentKeepalive` becomes 25 s.
+Check the fields and **Save & Restart**; nothing is saved by the import itself.
+
+Or fill in the **WireGuard VPN** section by hand with values from your WireGuard client config:
 
 | Web UI field | WireGuard config |
 |---|---|

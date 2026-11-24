@@ -774,6 +774,20 @@ static const char *html_page_head =
 static const char *html_page_script =
     "<script>"
     "var target=null;"
+    // WireGuard import: the repeater parses the file, the form gets the values
+    "function wgImport(input){"
+    "var m=document.getElementById('wg_import_msg'),f=input.files[0];if(!f)return;"
+    "if(f.size>4000){m.textContent='File too large';return}"
+    "m.textContent='Reading...';"
+    "f.text().then(function(t){return fetch('/wg_import',{method:'POST',body:t})})"
+    ".then(function(r){if(!r.ok)throw r.status;return r.json()}).then(function(j){"
+    "input.value='';"
+    "if(!j.ok){m.textContent='Import failed: '+j.error;return}"
+    "var e=input.form.elements;"
+    "for(var k in j.fields){var v=j.fields[k],el=e[k];if(!el)continue;"
+    "if(el.type=='checkbox')el.checked=!!v;else el.value=v}"
+    "m.textContent='Imported - check the fields and Save'+(j.warnings?' ('+j.warnings+')':'');"
+    "}).catch(function(x){m.textContent='Import failed ('+x+')'})}"
     "function scan(){"
     "var n=document.getElementById('nets');n.textContent='Scanning...';"
     "fetch('/scan').then(function(r){if(!r.ok)throw r.status;return r.json()}).then(function(l){"
@@ -971,6 +985,9 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "</div>"
                            "<div class='section'>"
                            "<h2>WireGuard VPN</h2>"
+                           "<label>Import a configuration file (.conf):</label>"
+                           "<input type='file' id='wg_file' accept='.conf,text/plain' onchange='wgImport(this)'>"
+                           "<div id='wg_import_msg' class='diag'></div>"
                            "<label><input type='checkbox' name='wg_en' value='1'");
   if (config->wg_enabled)
     httpd_resp_sendstr_chunk(req, " checked");
@@ -2313,6 +2330,86 @@ static wifi_ap_record_t *scan_networks(uint16_t *count, esp_err_t *err_out)
   return records;
 }
 
+/* JSON "name":"value" with the value escaped */
+static void send_json_field(httpd_req_t *req, const char *name, const char *value, bool first)
+{
+  httpd_resp_sendstr_chunk(req, first ? "\"" : ",\"");
+  httpd_resp_sendstr_chunk(req, name);
+  httpd_resp_sendstr_chunk(req, "\":");
+  send_json_string(req, value);
+}
+
+/**
+ * WireGuard import: the body is a .conf file, the answer the values for
+ * the form fields (JSON). Nothing is saved - the form's Save does that.
+ */
+static esp_err_t wg_import_handler(httpd_req_t *req)
+{
+  if (!check_auth(req))
+    return ESP_OK;
+  if (!is_same_origin(req))
+  {
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Cross-site request blocked");
+    return ESP_FAIL;
+  }
+
+  const size_t max_len = 4096;
+  char *body = (char *)malloc(max_len);
+  wg_import_t *wg = (wg_import_t *)malloc(sizeof(wg_import_t));
+  if (!body || !wg)
+  {
+    free(body);
+    free(wg);
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    return ESP_FAIL;
+  }
+
+  char error[128] = "";
+  bool ok = read_post_body(req, body, max_len);
+  if (!ok)
+    snprintf(error, sizeof(error), "The file is empty or larger than 4 KB");
+  else
+    ok = parse_wireguard_conf(body, wg, error, sizeof(error));
+  memset(body, 0, max_len); // the file holds the private key
+  free(body);
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  if (!ok)
+  {
+    httpd_resp_sendstr_chunk(req, "{\"ok\":false,\"error\":");
+    send_json_string(req, error);
+    httpd_resp_sendstr_chunk(req, "}");
+  }
+  else
+  {
+    char num[8];
+    httpd_resp_sendstr_chunk(req, "{\"ok\":true,\"fields\":{\"wg_en\":true");
+    send_json_field(req, "wg_addr", wg->address, false);
+    send_json_field(req, "wg_priv", wg->private_key, false);
+    send_json_field(req, "wg_peer", wg->peer_public_key, false);
+    // "-" removes a saved preshared key when the file has none
+    send_json_field(req, "wg_psk", wg->preshared_key[0] ? wg->preshared_key : "-", false);
+    send_json_field(req, "wg_host", wg->endpoint_host, false);
+    snprintf(num, sizeof(num), "%u", (unsigned)wg->endpoint_port);
+    send_json_field(req, "wg_port", num, false);
+    snprintf(num, sizeof(num), "%u", (unsigned)wg->keepalive);
+    send_json_field(req, "wg_ka", num, false);
+    send_json_field(req, "wg_dns", wg->dns, false);
+    send_json_field(req, "wg_mode", wg->full_tunnel ? "0" : "1", false);
+    send_json_field(req, "wg_split", wg->split, false);
+    httpd_resp_sendstr_chunk(req, "},\"warnings\":");
+    send_json_string(req, wg->warnings);
+    httpd_resp_sendstr_chunk(req, "}");
+    ESP_LOGI(TAG_MAIN, "WireGuard config imported (%s tunnel, endpoint %s:%u)", wg->full_tunnel ? "full" : "split",
+             wg->endpoint_host, (unsigned)wg->endpoint_port);
+  }
+  httpd_resp_sendstr_chunk(req, NULL);
+  memset(wg, 0, sizeof(*wg));
+  free(wg);
+  return ESP_OK;
+}
+
 static esp_err_t scan_handler(httpd_req_t *req)
 {
   if (!check_auth(req))
@@ -2643,6 +2740,7 @@ static httpd_handle_t start_webserver(void)
   config.uri_match_fn = httpd_uri_match_wildcard;
   config.lru_purge_enable = true; // OS captive portal probes open many connections
   config.open_fn = web_open_filter; // only clients of the repeater's WiFi
+  config.max_uri_handlers = 12;     // 7 registered, room for more
 
   ESP_LOGI(TAG_MAIN, "Starting web server on port %d", config.server_port);
 
@@ -2662,6 +2760,13 @@ static httpd_handle_t start_webserver(void)
         .handler = save_handler,
         .user_ctx = NULL};
     httpd_register_uri_handler(web_server, &save);
+
+    httpd_uri_t wg_import = {
+        .uri = "/wg_import",
+        .method = HTTP_POST,
+        .handler = wg_import_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(web_server, &wg_import);
 
     httpd_uri_t scan = {
         .uri = "/scan",

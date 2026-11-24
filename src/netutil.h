@@ -98,3 +98,26 @@ int login_locked_count(const login_limiter_t *limiter, uint32_t now_ms);
  * \ ; , : and " are escaped with a backslash. False if out is too small.
  */
 bool wifi_qr_payload(char *out, size_t out_len, const char *ssid, const char *password);
+
+/*
+ * WireGuard configuration file (wg-quick / MikroTik / app export) for the
+ * web panel's import: the [Interface] and the first [Peer]. IPv4 only -
+ * IPv6 addresses and networks are skipped with a warning.
+ */
+typedef struct
+{
+  char private_key[45];
+  char address[20];      // first IPv4 address, "a.b.c.d/nn"
+  char dns[16];          // first IPv4 DNS server, empty if none
+  char peer_public_key[45];
+  char preshared_key[45]; // empty if none
+  char endpoint_host[64];
+  uint16_t endpoint_port;
+  uint16_t keepalive;
+  bool full_tunnel;      // AllowedIPs covers all of IPv4
+  char split[160];       // otherwise the IPv4 networks of AllowedIPs, "a.b.c.d/nn, ..."
+  char warnings[160];    // things that were skipped, empty if none
+} wg_import_t;
+
+/* Parse a WireGuard configuration file; false with the reason in error */
+bool parse_wireguard_conf(const char *text, wg_import_t *out, char *error, size_t error_len);

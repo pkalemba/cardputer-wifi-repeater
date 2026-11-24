@@ -725,6 +725,125 @@ TEST(test_wifi_qr_code)
   CHECK(qrcodegen_getSize(qr) <= 57);
 }
 
+/* ═══════════════════════════════ WireGuard import ═══════════════════════════════ */
+
+#define PRIV "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk="
+#define PEER "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
+#define PSK "FpCyhws9cxwWoV4xELtfJvjJN+zQVRPISllRWgeopVE="
+
+TEST(test_wg_import_full)
+{
+  // wg-quick / WireGuard app export with IPv6 next to IPv4, CRLF and comments
+  const char *conf = "# phone\r\n"
+                     "[Interface]\r\n"
+                     "PrivateKey = " PRIV "\r\n"
+                     "Address = 10.6.0.2/32, fd00::2/128\r\n"
+                     "DNS = 1.1.1.1, 2606:4700::1111\r\n"
+                     "ListenPort = 51820   ; ignored\r\n"
+                     "\r\n"
+                     "[Peer]\r\n"
+                     "PublicKey = " PEER "\r\n"
+                     "PresharedKey = " PSK "\r\n"
+                     "AllowedIPs = 0.0.0.0/0, ::/0\r\n"
+                     "Endpoint = vpn.example.com:443\r\n"
+                     "PersistentKeepalive = 15\r\n";
+  wg_import_t wg;
+  char error[128] = "";
+  CHECK(parse_wireguard_conf(conf, &wg, error, sizeof(error)));
+  CHECK_STR(error, "");
+  CHECK_STR(wg.private_key, PRIV);
+  CHECK_STR(wg.address, "10.6.0.2/32");
+  CHECK_STR(wg.dns, "1.1.1.1");
+  CHECK_STR(wg.peer_public_key, PEER);
+  CHECK_STR(wg.preshared_key, PSK);
+  CHECK_STR(wg.endpoint_host, "vpn.example.com");
+  CHECK_EQ(wg.endpoint_port, 443);
+  CHECK_EQ(wg.keepalive, 15);
+  CHECK(wg.full_tunnel);
+  CHECK_STR(wg.split, "");
+  CHECK(strstr(wg.warnings, "IPv6 entries ignored") != NULL);
+}
+
+TEST(test_wg_import_split)
+{
+  // MikroTik style: lower case keys, no keepalive, endpoint without port, /1 halves elsewhere
+  const char *conf = "[interface]\n"
+                     "privatekey=" PRIV "\n"
+                     "address=192.168.30.2\n"
+                     "[peer]\n"
+                     "publickey=" PEER "\n"
+                     "allowedips=192.168.1.0/24, 10.0.0.0/8\n"
+                     "allowedips=172.16.0.0/12\n"
+                     "endpoint=80.68.225.149\n";
+  wg_import_t wg;
+  char error[128] = "";
+  CHECK(parse_wireguard_conf(conf, &wg, error, sizeof(error)));
+  CHECK_STR(wg.address, "192.168.30.2/32");
+  CHECK_STR(wg.dns, "");
+  CHECK_STR(wg.preshared_key, "");
+  CHECK_STR(wg.endpoint_host, "80.68.225.149");
+  CHECK_EQ(wg.endpoint_port, 51820);
+  CHECK_EQ(wg.keepalive, 25); // set for NAT
+  CHECK(strstr(wg.warnings, "PersistentKeepalive") != NULL);
+  CHECK(!wg.full_tunnel);
+  CHECK_STR(wg.split, "192.168.1.0/24, 10.0.0.0/8, 172.16.0.0/12");
+
+  // 0.0.0.0/1 + 128.0.0.0/1 is all of IPv4
+  const char *halves = "[Interface]\nPrivateKey=" PRIV "\nAddress=10.0.0.2/24\n"
+                       "[Peer]\nPublicKey=" PEER "\nEndpoint=1.2.3.4:51820\nAllowedIPs=0.0.0.0/1,128.0.0.0/1\n";
+  CHECK(parse_wireguard_conf(halves, &wg, error, sizeof(error)));
+  CHECK(wg.full_tunnel);
+}
+
+TEST(test_wg_import_errors)
+{
+  wg_import_t wg;
+  char error[128];
+  CHECK(!parse_wireguard_conf("hello", &wg, error, sizeof(error)));
+  CHECK(strstr(error, "[Interface]") != NULL);
+  CHECK(!parse_wireguard_conf("[Interface]\nPrivateKey=" PRIV "\nAddress=10.0.0.2/32\n", &wg, error, sizeof(error)));
+  CHECK(strstr(error, "[Peer]") != NULL);
+
+  const char *bad_key = "[Interface]\nPrivateKey=abc\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" PEER
+                        "\nEndpoint=1.2.3.4:1\nAllowedIPs=0.0.0.0/0\n";
+  CHECK(!parse_wireguard_conf(bad_key, &wg, error, sizeof(error)));
+  CHECK(strstr(error, "PrivateKey") != NULL);
+
+  // A too long key must not be cut into a valid looking one
+  const char *long_key = "[Interface]\nPrivateKey=" PRIV "AAAA\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" PEER
+                         "\nEndpoint=1.2.3.4:1\nAllowedIPs=0.0.0.0/0\n";
+  CHECK(!parse_wireguard_conf(long_key, &wg, error, sizeof(error)));
+
+  const char *v6_endpoint = "[Interface]\nPrivateKey=" PRIV "\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" PEER
+                            "\nEndpoint=[2001:db8::1]:51820\nAllowedIPs=0.0.0.0/0\n";
+  CHECK(!parse_wireguard_conf(v6_endpoint, &wg, error, sizeof(error)));
+  CHECK(strstr(error, "IPv6") != NULL);
+
+  const char *bad_port = "[Interface]\nPrivateKey=" PRIV "\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" PEER
+                         "\nEndpoint=host:99999\nAllowedIPs=0.0.0.0/0\n";
+  CHECK(!parse_wireguard_conf(bad_port, &wg, error, sizeof(error)));
+
+  const char *v6_only = "[Interface]\nPrivateKey=" PRIV "\nAddress=fd00::2/128\n[Peer]\nPublicKey=" PEER
+                        "\nEndpoint=1.2.3.4\nAllowedIPs=::/0\n";
+  CHECK(!parse_wireguard_conf(v6_only, &wg, error, sizeof(error)));
+  CHECK(strstr(error, "IPv4 Address") != NULL);
+
+  const char *too_many = "[Interface]\nPrivateKey=" PRIV "\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" PEER
+                         "\nEndpoint=1.2.3.4\nAllowedIPs=1.0.0.0/8,2.0.0.0/8,3.0.0.0/8,4.0.0.0/8,5.0.0.0/8,"
+                         "6.0.0.0/8,7.0.0.0/8,8.0.0.0/8,9.0.0.0/8\n";
+  CHECK(!parse_wireguard_conf(too_many, &wg, error, sizeof(error)));
+  CHECK(strstr(error, "8") != NULL);
+
+  // Two peers: the first one is used, with a warning
+  const char *two = "[Interface]\nPrivateKey=" PRIV "\nAddress=10.0.0.2/32\n"
+                    "[Peer]\nPublicKey=" PEER "\nEndpoint=first.example\nAllowedIPs=10.1.0.0/16\n"
+                    "[Peer]\nPublicKey=" PSK "\nEndpoint=second.example\nAllowedIPs=10.2.0.0/16\n";
+  CHECK(parse_wireguard_conf(two, &wg, error, sizeof(error)));
+  CHECK_STR(wg.endpoint_host, "first.example");
+  CHECK_STR(wg.split, "10.1.0.0/16");
+  CHECK(strstr(wg.warnings, "first [Peer]") != NULL);
+}
+
 int main(void)
 {
   RUN(test_url_decode);
@@ -746,6 +865,9 @@ int main(void)
   RUN(test_login_limiter);
   RUN(test_wifi_qr_payload);
   RUN(test_wifi_qr_code);
+  RUN(test_wg_import_full);
+  RUN(test_wg_import_split);
+  RUN(test_wg_import_errors);
   printf("\n%d checks, %d failed\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }

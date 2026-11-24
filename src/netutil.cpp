@@ -542,3 +542,255 @@ bool wifi_qr_payload(char *out, size_t out_len, const char *ssid, const char *pa
     out[0] = '\0';
   return ok;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * WireGuard configuration import
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static bool is_wg_key(const char *key)
+{
+  if (strlen(key) != 44 || key[43] != '=')
+    return false;
+  for (int i = 0; i < 43; i++)
+    if (!isalnum((unsigned char)key[i]) && key[i] != '+' && key[i] != '/')
+      return false;
+  return true;
+}
+
+/* Copy a key; one too long for the field is marked invalid instead of cut */
+static void copy_key(char *dst, size_t dst_len, const char *value)
+{
+  if (strlen(value) >= dst_len)
+    snprintf(dst, dst_len, "!");
+  else
+    snprintf(dst, dst_len, "%s", value);
+}
+
+static char *trim(char *s)
+{
+  while (isspace((unsigned char)*s))
+    s++;
+  char *end = s + strlen(s);
+  while (end > s && isspace((unsigned char)end[-1]))
+    *--end = '\0';
+  return s;
+}
+
+static void add_warning(wg_import_t *out, const char *warning)
+{
+  if (strstr(out->warnings, warning))
+    return; // once is enough
+  size_t len = strlen(out->warnings);
+  snprintf(out->warnings + len, sizeof(out->warnings) - len, "%s%s", len ? "; " : "", warning);
+}
+
+static bool fail(char *error, size_t error_len, const char *message)
+{
+  snprintf(error, error_len, "%s", message);
+  return false;
+}
+
+bool parse_wireguard_conf(const char *text, wg_import_t *out, char *error, size_t error_len)
+{
+  memset(out, 0, sizeof(*out));
+  enum { NONE, INTERFACE, PEER, OTHER } section = NONE;
+  int peers = 0;
+  bool have_interface = false, have_allowed = false;
+  char allowed[512] = {0}; // AllowedIPs of the first peer (all lines joined)
+  char line[512];
+
+  const char *p = text;
+  while (*p)
+  {
+    size_t len = strcspn(p, "\r\n");
+    if (len >= sizeof(line))
+      return fail(error, error_len, "A line of the file is too long");
+    memcpy(line, p, len);
+    line[len] = '\0';
+    p += len;
+    while (*p == '\r' || *p == '\n')
+      p++;
+
+    char *comment = strpbrk(line, "#;");
+    if (comment)
+      *comment = '\0';
+    char *l = trim(line);
+    if (*l == '\0')
+      continue;
+
+    if (*l == '[')
+    {
+      if (strcasecmp(l, "[Interface]") == 0)
+      {
+        section = INTERFACE;
+        have_interface = true;
+      }
+      else if (strcasecmp(l, "[Peer]") == 0)
+      {
+        section = PEER;
+        if (++peers == 2)
+          add_warning(out, "only the first [Peer] is used");
+      }
+      else
+        section = OTHER;
+      continue;
+    }
+
+    char *eq = strchr(l, '=');
+    if (!eq)
+      continue;
+    *eq = '\0';
+    char *key = trim(l);
+    char *value = trim(eq + 1);
+    // The value keeps the '=' padding of keys: the line is split at the first '='
+    if (section == INTERFACE && strcasecmp(key, "PrivateKey") == 0)
+      copy_key(out->private_key, sizeof(out->private_key), value);
+    else if (section == INTERFACE && strcasecmp(key, "Address") == 0)
+    {
+      char list[256];
+      snprintf(list, sizeof(list), "%s", value);
+      for (char *item = strtok(list, ", "); item; item = strtok(NULL, ", "))
+      {
+        if (strchr(item, ':'))
+        {
+          add_warning(out, "IPv6 entries ignored");
+          continue;
+        }
+        if (out->address[0] == '\0')
+        {
+          char ip[16], mask[16];
+          if (!parse_cidr(item, ip, sizeof(ip), mask, sizeof(mask)))
+            return fail(error, error_len, "Address is not a valid IPv4 address");
+          snprintf(out->address, sizeof(out->address), "%s%s", item, strchr(item, '/') ? "" : "/32");
+        }
+      }
+    }
+    else if (section == INTERFACE && strcasecmp(key, "DNS") == 0)
+    {
+      char list[256];
+      snprintf(list, sizeof(list), "%s", value);
+      for (char *item = strtok(list, ", "); item; item = strtok(NULL, ", "))
+      {
+        uint32_t a;
+        if (parse_ipv4(item, &a))
+        {
+          if (out->dns[0] == '\0')
+            snprintf(out->dns, sizeof(out->dns), "%s", item);
+        }
+        else if (strchr(item, ':'))
+          add_warning(out, "IPv6 entries ignored");
+        else
+          add_warning(out, "DNS search domains ignored");
+      }
+    }
+    else if (section == PEER && peers == 1)
+    {
+      if (strcasecmp(key, "PublicKey") == 0)
+        copy_key(out->peer_public_key, sizeof(out->peer_public_key), value);
+      else if (strcasecmp(key, "PresharedKey") == 0)
+        copy_key(out->preshared_key, sizeof(out->preshared_key), value);
+      else if (strcasecmp(key, "Endpoint") == 0)
+      {
+        if (value[0] == '[')
+          return fail(error, error_len, "IPv6 endpoints are not supported - use an IPv4 address or a host name");
+        char *colon = strrchr(value, ':');
+        long port = 51820;
+        if (colon)
+        {
+          char *end;
+          port = strtol(colon + 1, &end, 10);
+          if (end == colon + 1 || *end != '\0' || port < 1 || port > 65535)
+            return fail(error, error_len, "Endpoint port must be 1-65535");
+          *colon = '\0';
+        }
+        if (value[0] == '\0' || strlen(value) >= sizeof(out->endpoint_host))
+          return fail(error, error_len, "Endpoint host is missing or too long");
+        snprintf(out->endpoint_host, sizeof(out->endpoint_host), "%s", value);
+        out->endpoint_port = (uint16_t)port;
+      }
+      else if (strcasecmp(key, "PersistentKeepalive") == 0)
+      {
+        char *end;
+        long keepalive = strtol(value, &end, 10);
+        if (end == value || *end != '\0' || keepalive < 0 || keepalive > 65535)
+          return fail(error, error_len, "PersistentKeepalive must be 0-65535 seconds");
+        out->keepalive = (uint16_t)keepalive;
+      }
+      else if (strcasecmp(key, "AllowedIPs") == 0)
+      {
+        have_allowed = true;
+        size_t used = strlen(allowed);
+        snprintf(allowed + used, sizeof(allowed) - used, "%s%s", used ? "," : "", value);
+      }
+    }
+  }
+
+  if (!have_interface)
+    return fail(error, error_len, "No [Interface] section - is this a WireGuard configuration file?");
+  if (peers == 0)
+    return fail(error, error_len, "No [Peer] section");
+  if (!is_wg_key(out->private_key))
+    return fail(error, error_len, "PrivateKey is missing or not a 44 character base64 key");
+  if (!is_wg_key(out->peer_public_key))
+    return fail(error, error_len, "Peer PublicKey is missing or not a 44 character base64 key");
+  if (out->preshared_key[0] && !is_wg_key(out->preshared_key))
+    return fail(error, error_len, "PresharedKey is not a 44 character base64 key");
+  if (out->address[0] == '\0')
+    return fail(error, error_len, "No IPv4 Address in [Interface]");
+  if (out->endpoint_host[0] == '\0')
+    return fail(error, error_len, "Peer Endpoint is missing");
+
+  // The repeater sits behind NAT: keepalive keeps the mapping open
+  if (out->keepalive == 0)
+  {
+    out->keepalive = 25;
+    add_warning(out, "PersistentKeepalive set to 25 s");
+  }
+
+  // AllowedIPs: everything (0.0.0.0/0, or the two halves /1) = full tunnel
+  out->full_tunnel = !have_allowed;
+  if (!have_allowed)
+    add_warning(out, "no AllowedIPs - full tunnel");
+  bool low_half = false, high_half = false;
+  int networks = 0;
+  for (char *item = strtok(allowed, ", "); item; item = strtok(NULL, ", "))
+  {
+    if (strchr(item, ':'))
+    {
+      add_warning(out, "IPv6 entries ignored");
+      continue;
+    }
+    uint32_t net, mask;
+    if (parse_split_networks(item, &net, &mask, 1) != 1)
+      return fail(error, error_len, "AllowedIPs has an entry that is not an IPv4 network");
+    if (mask == 0)
+      out->full_tunnel = true;
+    const uint8_t *bytes = (const uint8_t *)&net;
+    const uint8_t *mask_bytes = (const uint8_t *)&mask;
+    if (mask_bytes[0] == 0x80 && mask_bytes[1] == 0 && mask_bytes[2] == 0 && mask_bytes[3] == 0)
+    {
+      if (bytes[0] == 0)
+        low_half = true;
+      else if (bytes[0] == 128)
+        high_half = true;
+    }
+    size_t used = strlen(out->split);
+    if (used + strlen(item) + 3 >= sizeof(out->split))
+      return fail(error, error_len, "AllowedIPs has too many networks for the split tunnel");
+    snprintf(out->split + used, sizeof(out->split) - used, "%s%s", used ? ", " : "", item);
+    networks++;
+  }
+  if (low_half && high_half)
+    out->full_tunnel = true;
+  if (out->full_tunnel)
+    out->split[0] = '\0';
+  else if (networks == 0)
+    return fail(error, error_len, "AllowedIPs has no IPv4 networks");
+  else
+  {
+    uint32_t nets[8], masks[8];
+    if (parse_split_networks(out->split, nets, masks, 8) < 0)
+      return fail(error, error_len, "AllowedIPs has more than 8 IPv4 networks (the split tunnel limit)");
+  }
+  return true;
+}
