@@ -188,6 +188,12 @@ fills in the fields - full tunnel for `AllowedIPs = 0.0.0.0/0`, split tunnel for
 networks; IPv6 entries are skipped (IPv4 only), a missing `PersistentKeepalive` becomes 25 s.
 Check the fields and **Save & Restart**; nothing is saved by the import itself.
 
+The configuration can also come from its **QR code** (WireGuard app, MikroTik): take a photo of
+it or pick a screenshot under "... or scan its QR code". This uses the browser's built-in QR
+reader (BarcodeDetector), available e.g. in Chrome on Android; other browsers show a note -
+use the `.conf` file there. A live camera view is not possible: browsers only allow it on
+https pages, and the panel is plain http.
+
 Or fill in the **WireGuard VPN** section by hand with values from your WireGuard client config:
 
 | Web UI field | WireGuard config |
