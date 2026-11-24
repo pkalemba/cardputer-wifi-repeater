@@ -741,29 +741,41 @@ static const char *html_page_head =
     "<html><head>"
     "<meta charset='UTF-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<meta name='theme-color' content='#282828'>"
     "<title>CardRepeater Config</title>"
     "<style>"
-    "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0}"
-    "h1{color:#333;text-align:center;background:#4CAF50;color:white;padding:15px;border-radius:5px}"
-    "form{background:white;padding:20px;border-radius:5px;box-shadow:0 2px 4px rgba(0,0,0,0.1);max-width:500px;margin:20px auto}"
-    "label{display:block;margin:10px 0 5px;font-weight:bold;color:#555}"
-    "input{width:100%;padding:8px;margin-bottom:15px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}"
-    "input[type=checkbox]{width:auto;margin:0 8px 0 0}"
-    "select{width:100%;padding:8px;margin-bottom:15px;border:1px solid #ddd;border-radius:4px}"
-    "button{background:#4CAF50;color:white;padding:12px 20px;border:none;border-radius:4px;cursor:pointer;width:100%;font-size:16px}"
-    "button:hover{background:#45a049}"
+    /* Gruvbox dark */
+    ":root{color-scheme:dark;--bg0:#282828;--bg0s:#32302f;--bg1:#3c3836;--bg2:#504945;--fg:#ebdbb2;--fg4:#a89984;"
+    "--yellow:#fabd2f;--green:#98971a;--green2:#b8bb26;--blue:#458588;--blue2:#83a598;--red:#fb4934;--purple:#d3869b}"
+    "body{font-family:Arial,sans-serif;margin:20px;background:var(--bg0);color:var(--fg)}"
+    "a{color:var(--blue2)}a:visited{color:var(--purple)}"
+    "h1{text-align:center;background:var(--bg1);color:var(--yellow);padding:15px;border-radius:5px;"
+    "border-bottom:3px solid var(--yellow)}"
+    "h2{color:var(--yellow);margin-top:0}"
+    "form{background:var(--bg0s);padding:20px;border-radius:5px;box-shadow:0 2px 6px rgba(0,0,0,0.4);max-width:500px;margin:20px auto}"
+    "label{display:block;margin:10px 0 5px;font-weight:bold;color:var(--fg)}"
+    "input,select{width:100%;padding:8px;margin-bottom:15px;border:1px solid var(--bg2);border-radius:4px;box-sizing:border-box;"
+    "background:var(--bg0);color:var(--fg)}"
+    "input:focus,select:focus{outline:none;border-color:var(--yellow)}"
+    "input::placeholder{color:var(--fg4)}"
+    "input[type=checkbox]{width:auto;margin:0 8px 0 0;accent-color:var(--green2)}"
+    "button{background:var(--green);color:var(--bg0);font-weight:bold;padding:12px 20px;border:none;border-radius:4px;"
+    "cursor:pointer;width:100%;font-size:16px}"
+    "button:hover{background:var(--green2)}"
     ".row{display:flex;gap:8px}.row input{flex:1}.row button{width:auto;padding:8px 14px;margin-bottom:15px;font-size:14px}"
-    ".net{padding:8px;margin:0 0 4px;background:#e8f5e9;border-radius:4px;cursor:pointer;font-size:14px}"
-    ".diag{font-size:12px;color:#666;word-break:break-all}"
-    ".build{font-size:12px;color:#888;text-align:center;margin:20px auto}"
-    ".btn{background:#607d8b;color:#fff;padding:8px 14px;border-radius:4px;text-decoration:none;font-size:14px}"
-    ".net:hover{background:#c8e6c9}"
-    ".info{background:#e3f2fd;padding:10px;border-radius:4px;margin:10px 0;border-left:4px solid #2196F3}"
-    ".section{margin:20px 0;padding:15px;background:#fafafa;border-radius:4px}"
+    ".net{padding:8px;margin:0 0 4px;background:var(--bg1);border-radius:4px;cursor:pointer;font-size:14px}"
+    ".net:hover{background:var(--bg2)}"
+    ".diag{font-size:12px;color:var(--fg4);word-break:break-all}"
+    ".build{font-size:12px;color:var(--fg4);text-align:center;margin:20px auto}"
+    ".btn{background:var(--blue);color:var(--fg)!important;padding:8px 14px;border-radius:4px;text-decoration:none;font-size:14px}"
+    ".btn:hover{background:var(--blue2);color:var(--bg0)!important}"
+    ".info{background:var(--bg1);color:var(--fg4);padding:10px;border-radius:4px;margin:10px 0;border-left:4px solid var(--blue2)}"
+    ".section{margin:20px 0;padding:15px;background:var(--bg1);border-radius:4px}"
+    ".section .info{background:var(--bg0s)}"
     ".status{text-align:center;padding:10px;margin:10px auto;border-radius:4px;max-width:520px}"
-    ".ok{background:#d4edda;color:#155724;border:1px solid #c3e6cb}"
-    ".warn{background:#fff3cd;color:#856404;border:1px solid #ffeeba}"
-    ".err{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb}"
+    ".ok{background:#32361a;color:var(--green2);border:1px solid var(--green2)}"
+    ".warn{background:#3c3521;color:var(--yellow);border:1px solid var(--yellow)}"
+    ".err{background:#402120;color:var(--red);border:1px solid var(--red)}"
     "</style></head><body>"
     "<h1>CardRepeater Setup</h1>";
 
@@ -892,7 +904,7 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
   httpd_resp_sendstr_chunk(req,
                            "<form action='/save' method='POST'>"
                            "<div class='section'>"
-                           "<h2 style='color:#4CAF50;margin-top:0'>Uplink WiFi</h2>"
+                           "<h2>Uplink WiFi</h2>"
                            "<label>Network Name (SSID):</label>"
                            "<div class='row'><input type='text' id='sta_ssid' name='sta_ssid' onfocus='target=this' value='");
   send_html_escaped(req, config->sta_ssid);
@@ -948,7 +960,7 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "start, for networks that limit free time per device.</div>"
                            "</div>"
                            "<div class='section'>"
-                           "<h2 style='color:#4CAF50;margin-top:0'>Access Point</h2>"
+                           "<h2>Access Point</h2>"
                            "<label>AP Name (SSID):</label>"
                            "<input type='text' name='ap_ssid' value='");
   send_html_escaped(req, config->ap_ssid);
@@ -961,7 +973,7 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "'><div class='info'>Note: Password must be at least 8 characters or leave empty for open network</div>"
                            "</div>"
                            "<div class='section'>"
-                           "<h2 style='color:#4CAF50;margin-top:0'>WireGuard VPN</h2>"
+                           "<h2>WireGuard VPN</h2>"
                            "<label><input type='checkbox' name='wg_en' value='1'");
   if (config->wg_enabled)
     httpd_resp_sendstr_chunk(req, " checked");
@@ -1030,7 +1042,7 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "with the kill switch, at all other times only through the VPN.</div>"
                            "</div>"
                            "<div class='section'>"
-                           "<h2 style='color:#4CAF50;margin-top:0'>Device</h2>"
+                           "<h2>Device</h2>"
                            "<label>Admin Password (web panel login):</label>"
                            "<input type='password' name='admin_pass' maxlength='63' placeholder='");
   if (strlen(config->admin_password) > 0)
@@ -1053,7 +1065,7 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
                            "Press G0 to wake the screen; hold G0 for 5 seconds to erase all settings.</div>"
                            "</div>"
                            "<div class='section'>"
-                           "<h2 style='color:#4CAF50;margin-top:0'>Battery</h2>"
+                           "<h2>Battery</h2>"
                            "<label>WiFi transmit power:</label><select name='tx_pwr'>");
   for (size_t i = 0; i < sizeof(TX_POWER_OPTIONS) / sizeof(TX_POWER_OPTIONS[0]); i++)
   {
@@ -1087,12 +1099,15 @@ static const char *html_success_page =
     "<meta charset='UTF-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<meta http-equiv='refresh' content='10;url=/'>"
+    "<meta name='theme-color' content='#282828'>"
     "<title>Config Saved</title>"
     "<style>"
-    "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0;text-align:center;padding-top:50px}"
-    ".success{background:#d4edda;color:#155724;padding:30px;border-radius:5px;max-width:500px;margin:0 auto;box-shadow:0 2px 4px rgba(0,0,0,0.1)}"
-    "h1{color:#155724;margin-top:0}"
-    ".spinner{border:4px solid #f3f3f3;border-top:4px solid #4CAF50;border-radius:50%;width:40px;height:40px;animation:spin 1s linear infinite;margin:20px auto}"
+    "body{font-family:Arial,sans-serif;margin:20px;background:#282828;color:#ebdbb2;text-align:center;padding-top:50px}"
+    ".success{background:#32302f;color:#ebdbb2;padding:30px;border-radius:5px;max-width:500px;margin:0 auto;"
+    "border-top:3px solid #b8bb26;box-shadow:0 2px 6px rgba(0,0,0,0.4)}"
+    "h1{color:#b8bb26;margin-top:0}"
+    ".hint{color:#a89984;font-size:14px}"
+    ".spinner{border:4px solid #504945;border-top:4px solid #fabd2f;border-radius:50%;width:40px;height:40px;animation:spin 1s linear infinite;margin:20px auto}"
     "@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}"
     "</style></head><body>"
     "<div class='success'>"
@@ -1100,7 +1115,7 @@ static const char *html_success_page =
     "<p>Your WiFi settings have been saved successfully.</p>"
     "<p>The device is restarting...</p>"
     "<div class='spinner'></div>"
-    "<p style='color:#666;font-size:14px'>This page will refresh in 10 seconds</p>"
+    "<p class='hint'>This page will refresh in 10 seconds</p>"
     "</div></body></html>";
 
 /**
