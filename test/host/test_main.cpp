@@ -4,6 +4,7 @@
  */
 
 #include "netutil.h"
+#include "qrcodegen/qrcodegen.h"
 #include "wifi_menu.h"
 
 #include <arpa/inet.h>
@@ -670,6 +671,60 @@ TEST(test_login_limiter)
   CHECK(login_allowed(&wrap, a, late + LOGIN_LOCK_MS + 1, NULL));
 }
 
+/* ═══════════════════════════════ WiFi QR code ═══════════════════════════════ */
+
+TEST(test_wifi_qr_payload)
+{
+  char out[256];
+  CHECK(wifi_qr_payload(out, sizeof(out), "Domek_Mobile", "secret123"));
+  CHECK_STR(out, "WIFI:T:WPA;S:Domek_Mobile;P:secret123;;");
+  CHECK(wifi_qr_payload(out, sizeof(out), "Open Cafe", ""));
+  CHECK_STR(out, "WIFI:T:nopass;S:Open Cafe;;");
+  CHECK(wifi_qr_payload(out, sizeof(out), "Open Cafe", NULL));
+  CHECK_STR(out, "WIFI:T:nopass;S:Open Cafe;;");
+  // Special characters are escaped
+  CHECK(wifi_qr_payload(out, sizeof(out), "a;b,c", "p:w\\d\"x"));
+  CHECK_STR(out, "WIFI:T:WPA;S:a\\;b\\,c;P:p\\:w\\\\d\\\"x;;");
+  // Too small: false and an empty string, never a cut payload
+  char small[20];
+  CHECK(!wifi_qr_payload(small, sizeof(small), "Domek_Mobile", "secret123"));
+  CHECK_STR(small, "");
+  // Longest SSID and password with every character escaped fit the firmware's buffer
+  char ssid[32], password[64];
+  memset(ssid, ';', 31);
+  ssid[31] = '\0';
+  memset(password, ':', 63);
+  password[63] = '\0';
+  char big[256];
+  CHECK(wifi_qr_payload(big, sizeof(big), ssid, password));
+  CHECK_EQ(strlen(big), 13 + 62 + 1 + 2 + 126 + 2);
+}
+
+TEST(test_wifi_qr_code)
+{
+  // The firmware encodes with version <= 10, low error correction (boosted)
+  uint8_t qr[qrcodegen_BUFFER_LEN_FOR_VERSION(10)];
+  uint8_t temp[qrcodegen_BUFFER_LEN_FOR_VERSION(10)];
+  char payload[256];
+  wifi_qr_payload(payload, sizeof(payload), "Domek_Mobile", "secret123");
+  CHECK(qrcodegen_encodeText(payload, temp, qr, qrcodegen_Ecc_LOW, 1, 10, qrcodegen_Mask_AUTO, true));
+  CHECK_EQ(qrcodegen_getSize(qr), 29); // version 3
+  // Finder pattern corners are dark
+  CHECK(qrcodegen_getModule(qr, 0, 0));
+  CHECK(qrcodegen_getModule(qr, 28, 0));
+  CHECK(qrcodegen_getModule(qr, 0, 28));
+
+  // The longest possible payload still fits version 10
+  char ssid[32], password[64], big[256];
+  memset(ssid, ';', 31);
+  ssid[31] = '\0';
+  memset(password, ':', 63);
+  password[63] = '\0';
+  wifi_qr_payload(big, sizeof(big), ssid, password);
+  CHECK(qrcodegen_encodeText(big, temp, qr, qrcodegen_Ecc_LOW, 1, 10, qrcodegen_Mask_AUTO, true));
+  CHECK(qrcodegen_getSize(qr) <= 57);
+}
+
 int main(void)
 {
   RUN(test_url_decode);
@@ -689,6 +744,8 @@ int main(void)
   RUN(test_menu_connect);
   RUN(test_validate_wpa_password);
   RUN(test_login_limiter);
+  RUN(test_wifi_qr_payload);
+  RUN(test_wifi_qr_code);
   printf("\n%d checks, %d failed\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }

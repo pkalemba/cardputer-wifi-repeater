@@ -91,3 +91,10 @@ bool login_failed(login_limiter_t *limiter, uint32_t addr, uint32_t now_ms);
 void login_succeeded(login_limiter_t *limiter, uint32_t addr);
 /* Addresses locked at now_ms */
 int login_locked_count(const login_limiter_t *limiter, uint32_t now_ms);
+
+/*
+ * Text of a WiFi QR code (phones join by scanning it):
+ * WIFI:T:WPA;S:<ssid>;P:<password>;;  or  WIFI:T:nopass;S:<ssid>;;
+ * \ ; , : and " are escaped with a backslash. False if out is too small.
+ */
+bool wifi_qr_payload(char *out, size_t out_len, const char *ssid, const char *password);

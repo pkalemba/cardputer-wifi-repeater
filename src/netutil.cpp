@@ -494,3 +494,51 @@ int login_locked_count(const login_limiter_t *limiter, uint32_t now_ms)
       count++;
   return count;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * WiFi QR code
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Append text with the special characters of the WIFI: format escaped */
+static bool append_escaped(char *out, size_t out_len, size_t *pos, const char *text)
+{
+  for (const char *c = text; *c; c++)
+  {
+    bool special = strchr("\\;,:\"", *c) != NULL;
+    if (*pos + (special ? 2 : 1) >= out_len)
+      return false;
+    if (special)
+      out[(*pos)++] = '\\';
+    out[(*pos)++] = *c;
+  }
+  out[*pos] = '\0';
+  return true;
+}
+
+static bool append_text(char *out, size_t out_len, size_t *pos, const char *text)
+{
+  size_t len = strlen(text);
+  if (*pos + len >= out_len)
+    return false;
+  memcpy(out + *pos, text, len + 1);
+  *pos += len;
+  return true;
+}
+
+bool wifi_qr_payload(char *out, size_t out_len, const char *ssid, const char *password)
+{
+  if (out_len == 0)
+    return false;
+  size_t pos = 0;
+  out[0] = '\0';
+  bool secured = password && password[0] != '\0';
+  bool ok = append_text(out, out_len, &pos, secured ? "WIFI:T:WPA;S:" : "WIFI:T:nopass;S:") &&
+            append_escaped(out, out_len, &pos, ssid) && append_text(out, out_len, &pos, ";");
+  if (ok && secured)
+    ok = append_text(out, out_len, &pos, "P:") && append_escaped(out, out_len, &pos, password) &&
+         append_text(out, out_len, &pos, ";");
+  ok = ok && append_text(out, out_len, &pos, ";");
+  if (!ok)
+    out[0] = '\0';
+  return ok;
+}

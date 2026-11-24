@@ -132,6 +132,8 @@ After configuration:
 
 ### Keyboard (Cardputer ADV)
 
+- **Q**: QR code to join the repeater's WiFi - scan it with the phone camera (Android and
+  iOS join right away); the network name and password are shown next to it. Any key closes it
 - **W**: WiFi menu - pick the uplink network on the device, no phone needed:
   - the list shows the networks in range: `*` = password needed, `+` = already saved, `<` = current
   - arrow keys: **↑ ↓** move, **→** (or Enter) joins, **←** goes back; **R** scans again
@@ -345,6 +347,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Designed for [M5Stack Cardputer](https://shop.m5stack.com/products/m5stack-cardputer-kit-w-m5stamps3)
 - Inspired by classic terminal aesthetics
 - NAPT implementation from ESP-IDF lwIP
+- QR codes: [QR Code generator library](https://www.nayuki.io/page/qr-code-generator-library) by Project Nayuki (MIT License), in `src/qrcodegen/`
 
 ---
 

@@ -55,6 +55,7 @@
 #include "esp_wireguard.h"
 #include "netutil.h"   // pure helpers, unit tested on the host (test/host)
 #include "wifi_menu.h" // on-device WiFi menu and key map, unit tested on the host
+#include "qrcodegen/qrcodegen.h" // Nayuki QR Code generator (MIT), vendored
 #include "wireguard.h" // peer state for the debug page (library pinned in platformio.ini)
 
 // Battery (ADC) includes
@@ -396,6 +397,8 @@ static char wg_status[96] = "disabled";
 static volatile bool wg_toggle_requested = false; // V key, handled in the status task
 static wifi_menu_t wifi_menu = {};                 // W key; MENU_CLOSED, changed in the UI task under display_mutex
 static void draw_menu_screen(void);
+static volatile bool qr_screen_shown = false; // Q key: QR code to join the repeater's WiFi
+static void draw_qr_screen(void);
 static bool wg_configured(void);
 static int64_t wg_connect_us = 0; // when the tunnel was started
 
@@ -3208,6 +3211,8 @@ static void display_update_status(void)
       draw_setup_screen();
     else if (wifi_menu.screen != MENU_CLOSED)
       draw_menu_screen();
+    else if (qr_screen_shown)
+      draw_qr_screen();
     else
       draw_status_screen();
     lcd_flush();
@@ -3402,7 +3407,7 @@ static bool keyboard_init(void)
   {
   }
   tca8418_write(TCA8418_REG_INT_STAT, 0x03);
-  ESP_LOGI(TAG_MAIN, "✓ Keyboard ready (W: WiFi menu, V: VPN, P: transmit power, E: eco mode)");
+  ESP_LOGI(TAG_MAIN, "✓ Keyboard ready (W: WiFi menu, Q: QR code, V: VPN, P: transmit power, E: eco mode)");
   return true;
 }
 
@@ -3444,6 +3449,78 @@ static bool wg_configured(void)
   return strlen(stored_config.wg_private_key) == WG_KEY_B64_LEN &&
          strlen(stored_config.wg_peer_public_key) == WG_KEY_B64_LEN &&
          strlen(stored_config.wg_endpoint) > 0 && strlen(stored_config.wg_address) > 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * QR CODE TO JOIN THE REPEATER'S WIFI (Q key)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#define QR_MAX_VERSION 10 // 57 modules: the longest SSID + password with every character escaped
+
+static void draw_qr_screen(void)
+{
+  static uint8_t qr[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
+  static uint8_t temp[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
+  char payload[256];
+
+  lcd_fill_screen(THEME_BG);
+  if (!wifi_qr_payload(payload, sizeof(payload), stored_config.ap_ssid, stored_config.ap_password) ||
+      !qrcodegen_encodeText(payload, temp, qr, qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN, QR_MAX_VERSION,
+                            qrcodegen_Mask_AUTO, true))
+  {
+    lcd_draw_string(8, 60, "QR code too long", THEME_ERROR, THEME_BG);
+    return;
+  }
+
+  // Dark modules on a light square with a quiet zone - what phone cameras expect
+  const int height = 135;
+  int size = qrcodegen_getSize(qr);
+  int scale = (height - 4) / (size + 4);
+  if (scale < 1)
+    scale = 1;
+  int side = (size + 4) * scale;
+  int left = 2, top = (height - side) / 2;
+  lcd_fill_rect(left, top, side, side, GRUV_FG);
+  for (int y = 0; y < size; y++)
+    for (int x = 0; x < size; x++)
+      if (qrcodegen_getModule(qr, x, y))
+        lcd_fill_rect(left + (x + 2) * scale, top + (y + 2) * scale, scale, scale, GRUV_BG0);
+
+  // Network name and password next to it, wrapped
+  int text_x = left + side + 8;
+  int columns = (240 - text_x) / 8;
+  if (columns < 4)
+    return;
+  int y = 6;
+  lcd_draw_string(text_x, y, "SCAN TO", THEME_TITLE, THEME_BG);
+  lcd_draw_string(text_x, y + 10, "JOIN", THEME_TITLE, THEME_BG);
+  y += 28;
+
+  const char *labels[2] = {"WiFi:", "Password:"};
+  const char *values[2] = {stored_config.ap_ssid,
+                           strlen(stored_config.ap_password) > 0 ? stored_config.ap_password : "(open)"};
+  for (int i = 0; i < 2; i++)
+  {
+    lcd_draw_string(text_x, y, labels[i], THEME_DIM, THEME_BG);
+    y += 10;
+    const char *value = values[i];
+    size_t remaining = strlen(value);
+    while (remaining > 0 && y < 112)
+    {
+      char line[32];
+      size_t n = remaining < (size_t)columns ? remaining : (size_t)columns;
+      if (n >= sizeof(line))
+        n = sizeof(line) - 1;
+      memcpy(line, value, n);
+      line[n] = '\0';
+      lcd_draw_string(text_x, y, line, THEME_TEXT, THEME_BG);
+      value += n;
+      remaining -= n;
+      y += 10;
+    }
+    y += 4;
+  }
+  lcd_draw_string(text_x, 124, "any key", THEME_DIM, THEME_BG);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -3669,6 +3746,12 @@ static void ui_task(void *pvParameters)
         wifi_menu_handle_key(code);
         continue;
       }
+      if (qr_screen_shown)
+      {
+        qr_screen_shown = false; // any key closes the QR code
+        display_wake();
+        continue;
+      }
       if ((code == 'v' || code == 'V') && status_task_handle)
       {
         // VPN on/off (done in the status task, next to the tunnel updates)
@@ -3682,6 +3765,11 @@ static void ui_task(void *pvParameters)
       else if (code == 'e' || code == 'E')
       {
         toggle_eco_mode();
+      }
+      else if (code == 'q' || code == 'Q')
+      {
+        // QR code: phones join the repeater's WiFi by scanning it
+        qr_screen_shown = true;
       }
       else if (code == 'w' || code == 'W')
       {
@@ -3698,6 +3786,8 @@ static void ui_task(void *pvParameters)
     // The menu closes when the screen turns off
     if (!display_on && wifi_menu.screen != MENU_CLOSED)
       wifi_menu.screen = MENU_CLOSED;
+    if (!display_on)
+      qr_screen_shown = false;
 
     // Screen timeout (the screen stays on in setup mode)
     if (!config_mode && stored_config.display_timeout > 0 && !pressed)
