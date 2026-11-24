@@ -53,6 +53,7 @@
 
 // WireGuard
 #include "esp_wireguard.h"
+#include "netutil.h" // pure helpers, unit tested on the host (test/host)
 #include "wireguard.h" // peer state for the debug page (library pinned in platformio.ini)
 
 // Battery (ADC) includes
@@ -424,41 +425,6 @@ static uint32_t split_mask[WG_SPLIT_MAX];
 static int split_count = 0;
 static struct netif *volatile split_route_netif = NULL; // set while the tunnel interface exists
 static volatile uint32_t split_routed_packets = 0;
-
-/**
- * Parse "a.b.c.d/nn, a.b.c.d/nn ..." into split_net/split_mask style
- * arrays. Returns the number of networks or -1 on a bad entry / too many.
- */
-static bool parse_cidr(const char *cidr, char *ip_out, size_t ip_len, char *mask_out, size_t mask_len);
-
-static int parse_split_networks(const char *list, uint32_t *nets, uint32_t *masks)
-{
-  int count = 0;
-  const char *p = list;
-  while (*p)
-  {
-    while (*p == ' ' || *p == ',' || *p == ';')
-      p++;
-    if (!*p)
-      break;
-    char entry[24];
-    size_t len = strcspn(p, " ,;");
-    if (len >= sizeof(entry) || count >= WG_SPLIT_MAX)
-      return -1;
-    memcpy(entry, p, len);
-    entry[len] = '\0';
-    p += len;
-
-    char ip[16], mask[16];
-    if (!parse_cidr(entry, ip, sizeof(ip), mask, sizeof(mask)))
-      return -1;
-    uint32_t m = ipaddr_addr(mask);
-    nets[count] = ipaddr_addr(ip) & m;
-    masks[count] = m;
-    count++;
-  }
-  return count;
-}
 
 static bool in_split_networks(uint32_t addr)
 {
@@ -1397,108 +1363,6 @@ static int battery_percent(void)
  * ═══════════════════════════════════════════════════════════════════ */
 
 /**
- * URL decode helper function
- */
-static void url_decode(char *dst, const char *src)
-{
-  char a, b;
-  while (*src)
-  {
-    if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b)))
-    {
-      if (a >= 'a')
-        a -= 'a' - 'A';
-      if (a >= 'A')
-        a -= ('A' - 10);
-      else
-        a -= '0';
-      if (b >= 'a')
-        b -= 'a' - 'A';
-      if (b >= 'A')
-        b -= ('A' - 10);
-      else
-        b -= '0';
-      *dst++ = 16 * a + b;
-      src += 3;
-    }
-    else if (*src == '+')
-    {
-      *dst++ = ' ';
-      src++;
-    }
-    else
-    {
-      *dst++ = *src++;
-    }
-  }
-  *dst = '\0';
-}
-
-/**
- * Parse URL query parameters and extract form fields
- */
-/**
- * Parse "AA:BB:CC:DD:EE:FF" (also with '-' or without separators). Only
- * unicast addresses (lowest bit of the first byte clear) are accepted.
- */
-static bool parse_mac(const char *text, uint8_t mac[6])
-{
-  int digits = 0;
-  uint8_t value[6] = {0};
-  for (const char *c = text; *c; c++)
-  {
-    if (*c == ':' || *c == '-' || *c == ' ')
-      continue;
-    if (!isxdigit((unsigned char)*c) || digits >= 12)
-      return false;
-    int nibble = isdigit((unsigned char)*c) ? *c - '0' : (tolower((unsigned char)*c) - 'a' + 10);
-    value[digits / 2] = (value[digits / 2] << 4) | nibble;
-    digits++;
-  }
-  if (digits != 12 || (value[0] & 0x01))
-    return false;
-  memcpy(mac, value, 6);
-  return true;
-}
-
-static bool parse_query_param(const char *query, const char *field_name, char *output, size_t output_len)
-{
-  if (!query)
-    return false;
-
-  char search_key[64];
-  snprintf(search_key, sizeof(search_key), "%s=", field_name);
-
-  // Match only whole field names (at the start or right after '&')
-  const char *start = query;
-  while ((start = strstr(start, search_key)) != NULL)
-  {
-    if (start == query || start[-1] == '&')
-      break;
-    start++;
-  }
-  if (!start)
-    return false;
-
-  start += strlen(search_key);
-  const char *end = strchr(start, '&');
-  size_t len = end ? (end - start) : strlen(start);
-
-  if (len >= output_len)
-    len = output_len - 1;
-
-  char temp[128];
-  if (len >= sizeof(temp))
-    len = sizeof(temp) - 1;
-
-  strncpy(temp, start, len);
-  temp[len] = '\0';
-
-  url_decode(output, temp);
-  return true;
-}
-
-/**
  * Save WiFi configuration to NVS
  */
 static esp_err_t save_wifi_config(const repeater_config_t *config)
@@ -1756,13 +1620,19 @@ static void uplink_scan_done(void)
   int best_rssi = 0;
   if (records && esp_wifi_scan_get_ap_records(&count, records) == ESP_OK)
   {
-    for (int r = 0; r < count && best < 0; r++)
-      for (int i = 0; i < UPLINK_NETWORKS && best < 0; i++)
-        if (network_ssid(i)[0] != '\0' && strcmp((const char *)records[r].ssid, network_ssid(i)) == 0)
-        {
-          best = i;
-          best_rssi = records[r].rssi;
-        }
+    const char *scan_ssids[20];
+    const char *saved_ssids[UPLINK_NETWORKS];
+    for (int r = 0; r < count; r++)
+      scan_ssids[r] = (const char *)records[r].ssid;
+    for (int i = 0; i < UPLINK_NETWORKS; i++)
+      saved_ssids[i] = network_ssid(i);
+    best = pick_best_network(scan_ssids, count, saved_ssids, UPLINK_NETWORKS);
+    for (int r = 0; best >= 0 && r < count; r++)
+      if (strcmp(scan_ssids[r], network_ssid(best)) == 0)
+      {
+        best_rssi = records[r].rssi;
+        break;
+      }
   }
   else
   {
@@ -1967,41 +1837,6 @@ static esp_err_t root_handler(httpd_req_t *req)
   httpd_resp_set_type(req, "text/html");
   send_config_html(req, &stored_config);
   return ESP_OK;
-}
-
-/**
- * Parse "a.b.c.d/prefix" into separate address and netmask strings.
- * A missing prefix means /32.
- */
-static bool parse_cidr(const char *cidr, char *ip_out, size_t ip_len, char *mask_out, size_t mask_len)
-{
-  char ip[16];
-  const char *slash = strchr(cidr, '/');
-  size_t addr_len = slash ? (size_t)(slash - cidr) : strlen(cidr);
-  if (addr_len == 0 || addr_len >= sizeof(ip))
-    return false;
-  memcpy(ip, cidr, addr_len);
-  ip[addr_len] = '\0';
-
-  ip4_addr_t addr;
-  if (!ip4addr_aton(ip, &addr))
-    return false;
-
-  int prefix = 32;
-  if (slash)
-  {
-    char *end;
-    prefix = strtol(slash + 1, &end, 10);
-    if (end == slash + 1 || *end != '\0' || prefix < 0 || prefix > 32)
-      return false;
-  }
-
-  uint32_t mask = prefix == 0 ? 0 : 0xFFFFFFFFu << (32 - prefix);
-  snprintf(ip_out, ip_len, "%s", ip);
-  snprintf(mask_out, mask_len, "%u.%u.%u.%u",
-           (unsigned)(mask >> 24) & 0xFF, (unsigned)(mask >> 16) & 0xFF,
-           (unsigned)(mask >> 8) & 0xFF, (unsigned)mask & 0xFF);
-  return true;
 }
 
 /**
@@ -2243,7 +2078,7 @@ static esp_err_t save_handler(httpd_req_t *req)
     else if (new_config.wg_mode == WG_SPLIT_TUNNEL)
     {
       uint32_t nets[WG_SPLIT_MAX], masks[WG_SPLIT_MAX];
-      int count = parse_split_networks(new_config.wg_split, nets, masks);
+      int count = parse_split_networks(new_config.wg_split, nets, masks, WG_SPLIT_MAX);
       if (count < 0)
         error = "Split tunnel networks: up to 8 entries like 192.168.1.0/24, separated by commas";
       else if (count == 0)
@@ -2741,84 +2576,8 @@ static httpd_handle_t start_webserver(void)
  * DNS SERVERS
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* Host names operating systems use to detect captive portals */
-static const char *const PORTAL_PROBE_HOSTS[] = {
-    "connectivitycheck.gstatic.com",
-    "connectivitycheck.android.com",
-    "clients3.google.com",
-    "captive.apple.com",
-    "www.appleiphonecell.com",
-    "www.msftconnecttest.com",
-    "ipv6.msftconnecttest.com",
-    "www.msftncsi.com",
-    "detectportal.firefox.com",
-    "nmcheck.gnome.org",
-    "network-test.debian.org",
-    "connectivity-check.ubuntu.com",
-    "connect.rom.miui.com",
-    "connectivitycheck.platform.hicloud.com",
-};
-
-#define DNS_HEADER_LEN 12
-#define DNS_ANSWER_LEN 16 // A record with a name pointer
 #define DNS_PROXY_SLOTS 16
 #define DNS_PROXY_TIMEOUT_MS 5000
-
-/**
- * Parse a standard query (QR=0, OPCODE=0) with exactly one question.
- * Writes the lower case name and type; returns the length of the
- * question section end (offset) or -1.
- */
-static int dns_parse_query(const uint8_t *buf, int len, char *name, size_t name_len, uint16_t *qtype)
-{
-  if (len < DNS_HEADER_LEN || (buf[2] & 0x80) || (buf[2] & 0x78) || buf[4] != 0 || buf[5] != 1)
-    return -1;
-
-  int pos = DNS_HEADER_LEN;
-  size_t out = 0;
-  while (pos < len && buf[pos] != 0)
-  {
-    int label = buf[pos];
-    if ((label & 0xC0) || pos + 1 + label > len)
-      return -1;
-    if (out > 0 && out < name_len - 1)
-      name[out++] = '.';
-    for (int i = 0; i < label; i++)
-      if (out < name_len - 1)
-        name[out++] = (char)tolower(buf[pos + 1 + i]);
-    pos += label + 1;
-  }
-  name[out] = '\0';
-  pos++; // zero length root label
-  if (pos + 4 > len)
-    return -1;
-  *qtype = (buf[pos] << 8) | buf[pos + 1];
-  return pos + 4;
-}
-
-/**
- * Turn the query in buf into an answer in place. With an address (network
- * byte order) an A
- * record follows the question (buf needs DNS_ANSWER_LEN spare bytes),
- * otherwise the answer is empty. Returns the answer length.
- */
-static int dns_build_answer(uint8_t *buf, int question_end, const uint32_t *addr, uint32_t ttl)
-{
-  buf[2] = 0x84 | (buf[2] & 0x01); // QR, AA, keep RD
-  buf[3] = 0x80;                   // RA, NOERROR
-  buf[6] = 0;
-  buf[7] = addr ? 1 : 0;      // ANCOUNT
-  memset(&buf[8], 0, 4);      // NSCOUNT, ARCOUNT - drops any EDNS record
-  if (!addr)
-    return question_end;
-
-  const uint8_t record[12] = {0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01,
-                              (uint8_t)(ttl >> 24), (uint8_t)(ttl >> 16), (uint8_t)(ttl >> 8), (uint8_t)ttl,
-                              0x00, 0x04};
-  memcpy(&buf[question_end], record, sizeof(record));
-  memcpy(&buf[question_end + 12], addr, 4);
-  return question_end + DNS_ANSWER_LEN;
-}
 
 static int dns_open_server_socket(void)
 {
@@ -2876,14 +2635,6 @@ static void captive_dns_task(void *pvParameters)
     int resp_len = dns_build_answer(buf, question_end, answer ? &ip_info.ip.addr : NULL, 60);
     sendto(sock, buf, resp_len, 0, (struct sockaddr *)&client, client_len);
   }
-}
-
-static bool is_portal_probe_host(const char *name)
-{
-  for (size_t i = 0; i < sizeof(PORTAL_PROBE_HOSTS) / sizeof(PORTAL_PROBE_HOSTS[0]); i++)
-    if (strcmp(name, PORTAL_PROBE_HOSTS[i]) == 0)
-      return true;
-  return false;
 }
 
 /**
@@ -3980,75 +3731,6 @@ static netif_output_fn wg_output_orig = NULL;
 static netif_output_fn ap_output_orig = NULL;
 static uint16_t tunnel_mss = 0;
 
-/**
- * Incremental Internet checksum update for one changed 16-bit word (RFC 1624)
- */
-static uint16_t checksum_replace_word(uint16_t checksum, uint16_t old_word, uint16_t new_word)
-{
-  uint32_t sum = (uint16_t)~checksum + (uint16_t)~old_word + new_word;
-  sum = (sum & 0xFFFF) + (sum >> 16);
-  sum = (sum & 0xFFFF) + (sum >> 16);
-  return (uint16_t)~sum;
-}
-
-/**
- * Lower the MSS option of an IPv4 TCP SYN segment to max_mss, in place
- */
-static void clamp_tcp_mss(uint8_t *packet, size_t len, uint16_t max_mss)
-{
-  if (len < 20 || (packet[0] >> 4) != 4 || packet[9] != IP_PROTO_TCP)
-    return;
-  // Only unfragmented packets (MF flag and fragment offset zero)
-  if ((packet[6] & 0x3F) != 0 || packet[7] != 0)
-    return;
-  size_t ip_hlen = (packet[0] & 0x0F) * 4;
-  if (ip_hlen < 20 || len < ip_hlen + 20)
-    return;
-
-  uint8_t *tcp = packet + ip_hlen;
-  size_t tcp_hlen = (tcp[12] >> 4) * 4;
-  if (!(tcp[13] & 0x02) || tcp_hlen < 20 || len < ip_hlen + tcp_hlen)
-    return; // not a SYN or truncated
-
-  for (size_t i = 20; i < tcp_hlen;)
-  {
-    uint8_t kind = tcp[i];
-    if (kind == 0) // end of option list
-      break;
-    if (kind == 1) // NOP
-    {
-      i++;
-      continue;
-    }
-    if (i + 1 >= tcp_hlen || tcp[i + 1] < 2 || i + tcp[i + 1] > tcp_hlen)
-      break; // malformed
-    if (kind == 2 && tcp[i + 1] == 4) // MSS
-    {
-      uint16_t mss = (tcp[i + 2] << 8) | tcp[i + 3];
-      if (mss <= max_mss)
-        return;
-
-      // The value may start at an odd offset and then spans two checksum words
-      size_t first = (i + 2) & ~(size_t)1;
-      size_t words = ((i + 2) & 1) ? 2 : 1;
-      uint16_t old_words[2];
-      for (size_t w = 0; w < words; w++)
-        old_words[w] = (tcp[first + 2 * w] << 8) | tcp[first + 2 * w + 1];
-
-      tcp[i + 2] = max_mss >> 8;
-      tcp[i + 3] = max_mss & 0xFF;
-
-      uint16_t checksum = (tcp[16] << 8) | tcp[17];
-      for (size_t w = 0; w < words; w++)
-        checksum = checksum_replace_word(checksum, old_words[w], (tcp[first + 2 * w] << 8) | tcp[first + 2 * w + 1]);
-      tcp[16] = checksum >> 8;
-      tcp[17] = checksum & 0xFF;
-      return;
-    }
-    i += tcp[i + 1];
-  }
-}
-
 /* Clients -> tunnel: SYN of new connections */
 static err_t wg_output_clamped(struct netif *netif, struct pbuf *p, const ip4_addr_t *addr)
 {
@@ -4699,7 +4381,7 @@ extern "C" void app_main(void)
   /* Split tunnel networks (validated when saved) */
   if (stored_config.wg_mode == WG_SPLIT_TUNNEL)
   {
-    split_count = parse_split_networks(stored_config.wg_split, split_net, split_mask);
+    split_count = parse_split_networks(stored_config.wg_split, split_net, split_mask, WG_SPLIT_MAX);
     if (split_count < 0)
       split_count = 0;
   }

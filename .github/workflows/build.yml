@@ -24,6 +24,19 @@ env:
   ESP_IDF_SIZE_VERSION: 2.3.2
 
 jobs:
+  test:
+    name: Unit tests (host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Hardware independent code (src/netutil.cpp, src/wifi_menu.cpp) with
+      # AddressSanitizer and UndefinedBehaviorSanitizer
+      - name: Build and run
+        run: make -C test/host
+
   build:
     name: Build firmware
     runs-on: ubuntu-latest
@@ -100,7 +113,7 @@ jobs:
   release:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [test, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
