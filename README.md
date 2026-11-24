@@ -132,6 +132,7 @@ After configuration:
 
 ### Keyboard (Cardputer ADV)
 
+- **?** (or /): shows these keys on the display; any key closes it
 - **Q**: QR code to join the repeater's WiFi - scan it with the phone camera (Android and
   iOS join right away); the network name and password are shown next to it. Any key closes it
 - **W**: WiFi menu - pick the uplink network on the device, no phone needed:

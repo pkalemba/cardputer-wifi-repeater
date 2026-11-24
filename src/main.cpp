@@ -399,6 +399,8 @@ static wifi_menu_t wifi_menu = {};                 // W key; MENU_CLOSED, change
 static void draw_menu_screen(void);
 static volatile bool qr_screen_shown = false; // Q key: QR code to join the repeater's WiFi
 static void draw_qr_screen(void);
+static volatile bool help_screen_shown = false; // ? key: the keyboard shortcuts
+static void draw_help_screen(void);
 static bool wg_configured(void);
 static int64_t wg_connect_us = 0; // when the tunnel was started
 
@@ -3213,6 +3215,8 @@ static void display_update_status(void)
       draw_menu_screen();
     else if (qr_screen_shown)
       draw_qr_screen();
+    else if (help_screen_shown)
+      draw_help_screen();
     else
       draw_status_screen();
     lcd_flush();
@@ -3407,7 +3411,7 @@ static bool keyboard_init(void)
   {
   }
   tca8418_write(TCA8418_REG_INT_STAT, 0x03);
-  ESP_LOGI(TAG_MAIN, "✓ Keyboard ready (W: WiFi menu, Q: QR code, V: VPN, P: transmit power, E: eco mode)");
+  ESP_LOGI(TAG_MAIN, "✓ Keyboard ready (?: help, W: WiFi menu, Q: QR code, V: VPN, P: transmit power, E: eco mode)");
   return true;
 }
 
@@ -3449,6 +3453,39 @@ static bool wg_configured(void)
   return strlen(stored_config.wg_private_key) == WG_KEY_B64_LEN &&
          strlen(stored_config.wg_peer_public_key) == WG_KEY_B64_LEN &&
          strlen(stored_config.wg_endpoint) > 0 && strlen(stored_config.wg_address) > 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * KEYBOARD HELP (? key)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static void draw_help_screen(void)
+{
+  static const struct
+  {
+    const char *key;
+    const char *action;
+  } HELP[] = {
+      {"W", "WiFi menu - pick network"},
+      {"Q", "QR code to join"},
+      {"V", "VPN on / off"},
+      {"P", "WiFi transmit power"},
+      {"E", "eco mode on / off"},
+      {"?", "this help"},
+      {"G0", "wake screen"},
+      {"G0", "hold 5 s: erase settings"},
+  };
+
+  lcd_fill_screen(THEME_BG);
+  lcd_fill_rect(0, 0, 240, 16, THEME_BAR);
+  lcd_draw_string(64, 4, "KEYBOARD KEYS", THEME_TITLE, THEME_BAR);
+  for (size_t i = 0; i < sizeof(HELP) / sizeof(HELP[0]); i++)
+  {
+    int y = 22 + (int)i * 12;
+    lcd_draw_string(8, y, HELP[i].key, THEME_TITLE, THEME_BG);
+    lcd_draw_string(40, y, HELP[i].action, THEME_TEXT, THEME_BG);
+  }
+  lcd_draw_string(8, 124, "any key: close", THEME_DIM, THEME_BG);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -3746,9 +3783,10 @@ static void ui_task(void *pvParameters)
         wifi_menu_handle_key(code);
         continue;
       }
-      if (qr_screen_shown)
+      if (qr_screen_shown || help_screen_shown)
       {
-        qr_screen_shown = false; // any key closes the QR code
+        qr_screen_shown = false; // any key closes the QR code / the help
+        help_screen_shown = false;
         display_wake();
         continue;
       }
@@ -3765,6 +3803,11 @@ static void ui_task(void *pvParameters)
       else if (code == 'e' || code == 'E')
       {
         toggle_eco_mode();
+      }
+      else if (code == '?' || code == '/')
+      {
+        // Keyboard help (? is shift + /)
+        help_screen_shown = true;
       }
       else if (code == 'q' || code == 'Q')
       {
@@ -3787,7 +3830,10 @@ static void ui_task(void *pvParameters)
     if (!display_on && wifi_menu.screen != MENU_CLOSED)
       wifi_menu.screen = MENU_CLOSED;
     if (!display_on)
+    {
       qr_screen_shown = false;
+      help_screen_shown = false;
+    }
 
     // Screen timeout (the screen stays on in setup mode)
     if (!config_mode && stored_config.display_timeout > 0 && !pressed)
