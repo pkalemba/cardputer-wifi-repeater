@@ -391,3 +391,106 @@ int pick_best_network(const char *const scan_ssids[], int scan_count, const char
         return i;
   return -1;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Passwords and logins
+ * ═══════════════════════════════════════════════════════════════════ */
+
+const char *validate_wpa_password(const char *password)
+{
+  size_t len = strlen(password);
+  if (len == 64)
+  {
+    for (size_t i = 0; i < len; i++)
+      if (!isxdigit((unsigned char)password[i]))
+        return "A 64 character password must be a hex key (0-9, a-f)";
+    return NULL;
+  }
+  if (len < 8 || len > 63)
+    return "The password needs 8-63 characters";
+  for (size_t i = 0; i < len; i++)
+    if ((unsigned char)password[i] < 0x20 || (unsigned char)password[i] > 0x7E)
+      return "The password may only use plain ASCII characters (no accents or emoji)";
+  return NULL;
+}
+
+/* Time comparisons survive the millisecond counter wrapping around */
+static bool time_before(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
+
+static login_entry_t *find_entry(login_limiter_t *limiter, uint32_t addr)
+{
+  for (int i = 0; i < LOGIN_LIMITER_ENTRIES; i++)
+    if (limiter->entries[i].used && limiter->entries[i].addr == addr)
+      return &limiter->entries[i];
+  return NULL;
+}
+
+bool login_allowed(login_limiter_t *limiter, uint32_t addr, uint32_t now_ms, uint32_t *wait_ms)
+{
+  login_entry_t *entry = find_entry(limiter, addr);
+  if (entry && entry->locked_until != 0)
+  {
+    if (time_before(now_ms, entry->locked_until))
+    {
+      if (wait_ms)
+        *wait_ms = entry->locked_until - now_ms;
+      return false;
+    }
+    // Lock over: a fresh start
+    entry->locked_until = 0;
+    entry->failures = 0;
+  }
+  return true;
+}
+
+bool login_failed(login_limiter_t *limiter, uint32_t addr, uint32_t now_ms)
+{
+  login_entry_t *entry = find_entry(limiter, addr);
+  if (!entry)
+  {
+    // A free entry, else the one not seen for the longest time
+    entry = &limiter->entries[0];
+    for (int i = 0; i < LOGIN_LIMITER_ENTRIES; i++)
+    {
+      login_entry_t *candidate = &limiter->entries[i];
+      if (!candidate->used)
+      {
+        entry = candidate;
+        break;
+      }
+      if (time_before(candidate->last_seen, entry->last_seen))
+        entry = candidate;
+    }
+    memset(entry, 0, sizeof(*entry));
+    entry->used = true;
+    entry->addr = addr;
+  }
+  entry->last_seen = now_ms;
+  if (entry->failures < 255)
+    entry->failures++;
+  if (entry->failures >= LOGIN_MAX_FAILURES && entry->locked_until == 0)
+  {
+    entry->locked_until = now_ms + LOGIN_LOCK_MS;
+    if (entry->locked_until == 0)
+      entry->locked_until = 1; // 0 means "not locked"
+    return true;
+  }
+  return false;
+}
+
+void login_succeeded(login_limiter_t *limiter, uint32_t addr)
+{
+  login_entry_t *entry = find_entry(limiter, addr);
+  if (entry)
+    memset(entry, 0, sizeof(*entry));
+}
+
+int login_locked_count(const login_limiter_t *limiter, uint32_t now_ms)
+{
+  int count = 0;
+  for (int i = 0; i < LOGIN_LIMITER_ENTRIES; i++)
+    if (limiter->entries[i].used && limiter->entries[i].locked_until != 0 &&
+        time_before(now_ms, limiter->entries[i].locked_until))
+      count++;
+  return count;
+}

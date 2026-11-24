@@ -57,6 +57,8 @@
 ### ⚙️ Web Configuration
 - **Easy Setup**: Web-UI based configuration interface (because I couldn't get the built in keyboard working)
 - **Password protected**: log in with any user name and the admin password set during setup
+- **Only from the repeater's WiFi**: the panel does not answer on the uplink side (e.g. to other hotel guests), and after 5 wrong passwords an address has to wait 60 s
+- **The repeater's WiFi always has a password** (WPA2, 8-63 characters); older configs with an open network keep working but the display shows `OPEN!` and the panel asks for a password
 - **Debug page**: the **Debug info** button shows the uplink connection details (last disconnect reason, security, IP, DNS), the last internet check and the recent log as plain text - easy to copy into a bug report. **Debug + WiFi scan** also lists the networks in range and whether the uplink is among them
 - **Build info**: the firmware version (`git describe`: release tag or commit) and build time are shown at the bottom of the page
 
@@ -108,7 +110,7 @@ When powered on for the first time:
    - Opens automatically on most devices, or browse to `http://192.168.4.1`
    - Enter your settings:
      - **Uplink WiFi**: Network to connect to (internet source) - use **Scan** to list nearby networks
-     - **Access Point**: Your repeater's network name and password
+     - **Access Point**: Your repeater's network name and password (required, 8-63 characters)
      - **WireGuard VPN** (optional): see below
      - **Device**: admin password for the web panel (required, at least 8 characters) and the screen timeout
 

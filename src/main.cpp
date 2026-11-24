@@ -884,6 +884,9 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
   httpd_resp_sendstr_chunk(req, "<div class='status' style='display:flex;gap:8px;justify-content:center'>"
                                 "<a class='btn' href='/debug?check=1' target='_blank'>Debug info</a>"
                                 "<a class='btn' href='/debug?scan=1' target='_blank'>Debug + WiFi scan</a></div>");
+  if (!config_mode && strlen(config->ap_password) == 0)
+    httpd_resp_sendstr_chunk(req, "<div class='status err'><b>The repeater's WiFi is open</b> - anyone nearby can use "
+                                  "it. Set a password under Access Point.</div>");
   if (!config_mode && strlen(config->admin_password) == 0)
     httpd_resp_sendstr_chunk(req, "<div class='status err'>The web panel has no password yet - anyone on this "
                                   "network can change these settings. Set one under Device.</div>");
@@ -954,10 +957,12 @@ static void send_config_html(httpd_req_t *req, const repeater_config_t *config)
   httpd_resp_sendstr_chunk(req,
                            "' placeholder='CardRepeater' required>"
                            "<label>AP Password:</label>"
-                           "<input type='password' name='ap_pass' placeholder='");
-  httpd_resp_sendstr_chunk(req, strlen(config->ap_password) > 0 ? "Leave blank to keep current or empty for open" : "Leave empty for open network");
+                           "<input type='password' name='ap_pass' maxlength='63' placeholder='");
+  httpd_resp_sendstr_chunk(req, strlen(config->ap_password) > 0 ? "Leave blank to keep current'>"
+                                                                 : "8-63 characters' minlength='8' required>");
   httpd_resp_sendstr_chunk(req,
-                           "'><div class='info'>Note: Password must be at least 8 characters or leave empty for open network</div>"
+                           "<div class='info'>The repeater's WiFi always needs a password (WPA2): "
+                           "an open network would share your internet and VPN with everyone nearby.</div>"
                            "</div>"
                            "<div class='section'>"
                            "<h2>WireGuard VPN</h2>"
@@ -1725,11 +1730,50 @@ static void reconnect_timer_cb(void *arg)
  * HTTP Basic authentication for the web panel: any user name, the admin password.
  * Sends 401 and returns false if the request is not authorized.
  */
+static login_limiter_t login_limiter = {}; // httpd task only
+static volatile uint32_t web_refused_connections = 0; // from outside the repeater's WiFi
+
+/* IPv4 address of the client of a request or connection, 0 if unknown */
+static uint32_t client_address(int sockfd)
+{
+  struct sockaddr_storage peer = {};
+  socklen_t len = sizeof(peer);
+  if (getpeername(sockfd, (struct sockaddr *)&peer, &len) != 0)
+    return 0;
+  if (peer.ss_family == AF_INET)
+    return ((struct sockaddr_in *)&peer)->sin_addr.s_addr;
+#if LWIP_IPV6
+  if (peer.ss_family == AF_INET6)
+  {
+    // IPv4 clients on a dual stack socket show up as ::ffff:a.b.c.d
+    const struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&peer;
+    const uint32_t *words = v6->sin6_addr.un.u32_addr;
+    if (words[0] == 0 && words[1] == 0 && words[2] == PP_HTONL(0x0000FFFF))
+      return words[3];
+  }
+#endif
+  return 0;
+}
+
+static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+
 static bool check_auth(httpd_req_t *req)
 {
   // No password in setup mode and in configs saved by older firmware
   if (strlen(stored_config.admin_password) == 0)
     return true;
+
+  // Too many wrong passwords from this address: wait before trying again
+  uint32_t client = client_address(httpd_req_to_sockfd(req));
+  uint32_t wait = 0;
+  if (!login_allowed(&login_limiter, client, now_ms(), &wait))
+  {
+    char text[64];
+    snprintf(text, sizeof(text), "Too many wrong passwords - try again in %lu s", (unsigned long)(wait / 1000 + 1));
+    httpd_resp_set_status(req, "429 Too Many Requests");
+    httpd_resp_sendstr(req, text);
+    return false;
+  }
 
   char header[192];
   if (httpd_req_get_hdr_value_str(req, "Authorization", header, sizeof(header)) == ESP_OK &&
@@ -1737,13 +1781,27 @@ static bool check_auth(httpd_req_t *req)
   {
     unsigned char credentials[144];
     size_t len = 0;
+    bool ok = false;
     if (mbedtls_base64_decode(credentials, sizeof(credentials) - 1, &len,
                               (const unsigned char *)header + 6, strlen(header + 6)) == 0)
     {
       credentials[len] = '\0';
       const char *password = strchr((const char *)credentials, ':');
-      if (password && strcmp(password + 1, stored_config.admin_password) == 0)
-        return true;
+      ok = password && strcmp(password + 1, stored_config.admin_password) == 0;
+    }
+    memset(credentials, 0, sizeof(credentials));
+    if (ok)
+    {
+      login_succeeded(&login_limiter, client);
+      return true;
+    }
+    // Only a wrong password counts - browsers ask without one first
+    if (login_failed(&login_limiter, client, now_ms()))
+    {
+      ip4_addr_t a;
+      a.addr = client;
+      ESP_LOGW(TAG_MAIN, "Web panel: too many wrong passwords from " IPSTR " - locked for %d s", IP2STR(&a),
+               LOGIN_LOCK_MS / 1000);
     }
   }
 
@@ -1999,26 +2057,21 @@ static esp_err_t save_handler(httpd_req_t *req)
     error = "Missing ap_ssid";
   }
 
-  // Parse AP password, but only update if not empty (unless it was previously empty)
-  memset(temp_pass, 0, sizeof(temp_pass));
-  if (!error && parse_query_param(body, "ap_pass", temp_pass, sizeof(temp_pass)))
+  // AP password: blank keeps the saved one; the access point is never open
+  char ap_pass[80] = {0}; // larger than the field, so a too long password is noticed
+  if (!error && parse_query_param(body, "ap_pass", ap_pass, sizeof(ap_pass)) && strlen(ap_pass) > 0)
   {
-    // If new password provided, validate it
-    if (strlen(temp_pass) > 0)
-    {
-      if (strlen(temp_pass) < 8)
-      {
-        error = "AP password must be at least 8 characters or empty";
-      }
-      strncpy(new_config.ap_password, temp_pass, sizeof(new_config.ap_password));
-    }
-    // If empty and user explicitly wants open network, clear password
-    else if (strlen(stored_config.ap_password) == 0)
-    {
-      memset(new_config.ap_password, 0, sizeof(new_config.ap_password));
-    }
-    // Otherwise keep existing password
+    const char *problem = validate_wpa_password(ap_pass);
+    if (problem)
+      error = problem;
+    else if (strlen(ap_pass) >= sizeof(new_config.ap_password))
+      error = "The AP password needs 8-63 characters";
+    else
+      strlcpy(new_config.ap_password, ap_pass, sizeof(new_config.ap_password));
   }
+  memset(ap_pass, 0, sizeof(ap_pass));
+  if (!error && strlen(new_config.ap_password) == 0)
+    error = "The access point needs a password (8-63 characters)";
 
   /* WireGuard - checkbox is only present in the form data when checked */
   char temp[96] = {0};
@@ -2476,6 +2529,11 @@ static esp_err_t debug_handler(httpd_req_t *req)
                (tx_quarter_dbm % 4) * 25, stored_config.tx_power == 0 ? " (maximum)" : "",
                stored_config.eco_mode ? "on (CPU 80-160 MHz)" : "off (CPU 240 MHz)");
 
+  /* Web panel */
+  debug_printf(req, "\n== Web panel ==\nConnections refused from outside the repeater's WiFi: %lu\n"
+                    "Addresses locked after wrong passwords: %d\n",
+               (unsigned long)web_refused_connections, login_locked_count(&login_limiter, now_ms()));
+
   /* Access point */
   debug_printf(req, "\n== Access point ==\nSSID: \"%s\", address %s, channel %d, clients %d\n",
                stored_config.ap_ssid, ap_ip_str, WIFI_AP_CHANNEL, ap_client_count);
@@ -2553,12 +2611,33 @@ static esp_err_t captive_redirect_handler(httpd_req_t *req)
 /**
  * Start web server
  */
+/*
+ * Accept connections only from the repeater's own WiFi: the server listens
+ * on all interfaces, and the uplink side (hotel network) must not reach
+ * the panel. Returning an error closes the connection.
+ */
+static esp_err_t web_open_filter(httpd_handle_t hd, int sockfd)
+{
+  uint32_t client = client_address(sockfd);
+  esp_netif_ip_info_t ap_info;
+  if (client != 0 && ap_netif && esp_netif_get_ip_info(ap_netif, &ap_info) == ESP_OK &&
+      ((client ^ ap_info.ip.addr) & ap_info.netmask.addr) == 0)
+    return ESP_OK;
+
+  web_refused_connections = web_refused_connections + 1;
+  ip4_addr_t a;
+  a.addr = client;
+  ESP_LOGW(TAG_MAIN, "Web panel: connection from " IPSTR " refused (not a repeater client)", IP2STR(&a));
+  return ESP_FAIL;
+}
+
 static httpd_handle_t start_webserver(void)
 {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.stack_size = WEB_SERVER_STACK_SIZE;
   config.uri_match_fn = httpd_uri_match_wildcard;
   config.lru_purge_enable = true; // OS captive portal probes open many connections
+  config.open_fn = web_open_filter; // only clients of the repeater's WiFi
 
   ESP_LOGI(TAG_MAIN, "Starting web server on port %d", config.server_port);
 
@@ -3078,7 +3157,7 @@ static void draw_status_screen(void)
   }
   else
   {
-    lcd_draw_string(6, ap_y + 25, "Open", THEME_DIM, THEME_BG);
+    lcd_draw_string(6, ap_y + 25, "OPEN!", THEME_ERROR, THEME_BG); // no password - see the web panel
   }
 
   // Power settings (P / E keys), right-aligned

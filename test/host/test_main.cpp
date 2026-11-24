@@ -596,6 +596,80 @@ TEST(test_menu_connect)
   CHECK_EQ((int)strlen(menu.password), MENU_PASSWORD_MAX);
 }
 
+/* ═══════════════════════════════ security ═══════════════════════════════ */
+
+TEST(test_validate_wpa_password)
+{
+  CHECK(validate_wpa_password("1234567") != NULL); // 7
+  CHECK(validate_wpa_password("12345678") == NULL);
+  CHECK(validate_wpa_password("") != NULL);
+  char text[80];
+  memset(text, 'a', sizeof(text));
+  text[63] = '\0';
+  CHECK(validate_wpa_password(text) == NULL); // 63
+  text[63] = 'a';
+  text[64] = '\0';
+  CHECK(validate_wpa_password(text) == NULL); // 64 hex digits ('a')
+  text[10] = 'g';
+  CHECK(validate_wpa_password(text) != NULL); // 64 characters, not hex
+  text[64] = 'a';
+  text[65] = '\0';
+  CHECK(validate_wpa_password(text) != NULL); // 65
+  CHECK(validate_wpa_password("pass word 1!") == NULL);
+  CHECK(validate_wpa_password("hasło12345") != NULL); // non-ASCII
+  CHECK(validate_wpa_password("tab\there1") != NULL);
+}
+
+TEST(test_login_limiter)
+{
+  login_limiter_t limiter = {};
+  uint32_t a = ip("192.168.4.2"), b = ip("192.168.4.3");
+  uint32_t now = 1000, wait = 0;
+
+  for (int i = 0; i < LOGIN_MAX_FAILURES - 1; i++)
+  {
+    CHECK(login_allowed(&limiter, a, now, &wait));
+    CHECK(!login_failed(&limiter, a, now));
+  }
+  CHECK(login_allowed(&limiter, a, now, &wait));
+  CHECK(login_failed(&limiter, a, now)); // 5th failure locks
+  CHECK(!login_allowed(&limiter, a, now + 1000, &wait));
+  CHECK_EQ(wait, LOGIN_LOCK_MS - 1000);
+  CHECK_EQ(login_locked_count(&limiter, now + 1000), 1);
+  CHECK(login_allowed(&limiter, b, now + 1000, &wait)); // other addresses are not affected
+
+  // Lock over: allowed again with a fresh count
+  CHECK(login_allowed(&limiter, a, now + LOGIN_LOCK_MS, &wait));
+  CHECK_EQ(login_locked_count(&limiter, now + LOGIN_LOCK_MS), 0);
+  CHECK(!login_failed(&limiter, a, now + LOGIN_LOCK_MS));
+
+  // Success forgets the failures
+  for (int i = 0; i < LOGIN_MAX_FAILURES - 1; i++)
+    login_failed(&limiter, b, now);
+  login_succeeded(&limiter, b);
+  CHECK(!login_failed(&limiter, b, now)); // counts from 1 again
+  CHECK(login_allowed(&limiter, b, now, &wait));
+
+  // Full table: the address not seen for the longest time is replaced
+  login_limiter_t full = {};
+  for (uint32_t i = 0; i < LOGIN_LIMITER_ENTRIES; i++)
+    login_failed(&full, 100 + i, 5000 + i);
+  login_failed(&full, 999, 9000); // replaces address 100
+  for (int i = 0; i < LOGIN_MAX_FAILURES - 1; i++)
+    login_failed(&full, 101, 9100);
+  CHECK(!login_allowed(&full, 101, 9200, NULL)); // 101 kept its first failure
+  for (int i = 0; i < LOGIN_MAX_FAILURES - 1; i++)
+    CHECK(!login_failed(&full, 100, 9300)); // 100 starts from scratch
+
+  // Millisecond counter wrapping around during a lock
+  login_limiter_t wrap = {};
+  uint32_t late = 0xFFFFFFFFu - 1000;
+  for (int i = 0; i < LOGIN_MAX_FAILURES; i++)
+    login_failed(&wrap, a, late);
+  CHECK(!login_allowed(&wrap, a, late + 5000, NULL)); // wrapped, still locked
+  CHECK(login_allowed(&wrap, a, late + LOGIN_LOCK_MS + 1, NULL));
+}
+
 int main(void)
 {
   RUN(test_url_decode);
@@ -613,6 +687,8 @@ int main(void)
   RUN(test_keyboard_map);
   RUN(test_menu_list);
   RUN(test_menu_connect);
+  RUN(test_validate_wpa_password);
+  RUN(test_login_limiter);
   printf("\n%d checks, %d failed\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }

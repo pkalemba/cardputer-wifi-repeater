@@ -53,3 +53,41 @@ int remember_network(char *const ssids[], char *const passwords[], int count, si
 
 /* Index of the strongest saved network in scan results sorted by RSSI, or -1 */
 int pick_best_network(const char *const scan_ssids[], int scan_count, const char *const saved_ssids[], int saved_count);
+
+/*
+ * WPA2 passphrase: 8-63 printable ASCII characters, or exactly 64 hex
+ * digits (the key itself). Returns NULL when valid, otherwise the reason.
+ */
+const char *validate_wpa_password(const char *password);
+
+/*
+ * Login limiter for the web panel: after LOGIN_MAX_FAILURES wrong
+ * passwords from one address, that address is locked for
+ * LOGIN_LOCK_MS. Addresses are IPv4 in any byte order; times in ms.
+ */
+#define LOGIN_LIMITER_ENTRIES 8
+#define LOGIN_MAX_FAILURES 5
+#define LOGIN_LOCK_MS 60000
+
+typedef struct
+{
+  uint32_t addr;
+  uint8_t failures;
+  uint32_t locked_until; // 0 = not locked
+  uint32_t last_seen;
+  bool used;
+} login_entry_t;
+
+typedef struct
+{
+  login_entry_t entries[LOGIN_LIMITER_ENTRIES];
+} login_limiter_t;
+
+/* False while addr is locked; then *wait_ms (if not NULL) is the time left */
+bool login_allowed(login_limiter_t *limiter, uint32_t addr, uint32_t now_ms, uint32_t *wait_ms);
+/* A wrong password from addr; returns true when this locked it */
+bool login_failed(login_limiter_t *limiter, uint32_t addr, uint32_t now_ms);
+/* A correct password: forget the failures of addr */
+void login_succeeded(login_limiter_t *limiter, uint32_t addr);
+/* Addresses locked at now_ms */
+int login_locked_count(const login_limiter_t *limiter, uint32_t now_ms);
