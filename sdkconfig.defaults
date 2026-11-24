@@ -24,6 +24,10 @@ CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 # NAPT and WireGuard encryption run in the TCP/IP task - on core 1, WiFi stays on core 0
 CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
 
+# Power management: eco mode (web panel) scales the CPU clock at runtime.
+# No light sleep / tickless idle - the access point has to stay up.
+CONFIG_PM_ENABLE=y
+
 # Increase main task stack size for display operations
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
